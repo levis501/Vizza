@@ -149,6 +149,28 @@ impl SimulationManager {
         }
     }
 
+    /// Get immutable reference to Vectors simulation if it's the current simulation
+    pub fn vectors_simulation(
+        &self,
+    ) -> Result<&crate::simulations::vectors::VectorsModel, String> {
+        match &self.current_simulation {
+            Some(SimulationType::Vectors(sim)) => Ok(sim),
+            Some(_) => Err("No Vectors simulation running".to_string()),
+            None => Err("No simulation running".to_string()),
+        }
+    }
+
+    /// Get mutable reference to Vectors simulation if it's the current simulation
+    pub fn vectors_simulation_mut(
+        &mut self,
+    ) -> Result<&mut crate::simulations::vectors::VectorsModel, String> {
+        match &mut self.current_simulation {
+            Some(SimulationType::Vectors(sim)) => Ok(sim),
+            Some(_) => Err("No Vectors simulation running".to_string()),
+            None => Err("No simulation running".to_string()),
+        }
+    }
+
     /// Get immutable reference to Pellets simulation if it's the current simulation
     pub fn pellets_simulation(
         &self,
@@ -417,6 +439,21 @@ impl SimulationManager {
                 self.resume();
                 Ok(())
             }
+            "vectors" => {
+                let settings = crate::simulations::vectors::Settings::default();
+                let simulation = crate::simulations::vectors::VectorsModel::new(
+                    device,
+                    queue,
+                    surface_config,
+                    settings,
+                    &self.app_settings,
+                    &self.color_scheme_manager,
+                )
+                .map_err(|e| format!("Failed to initialize Vectors simulation: {}", e))?;
+                self.current_simulation = Some(SimulationType::Vectors(Box::new(simulation)));
+                self.resume();
+                Ok(())
+            }
 
             _ => Err("Unknown simulation type".into()),
         }
@@ -592,7 +629,7 @@ impl SimulationManager {
                         queue,
                     )?;
                 }
-
+                SimulationType::Vectors(_) => {}
                 _ => (),
             }
         }
@@ -624,7 +661,7 @@ impl SimulationManager {
                 SimulationType::PrimordialParticles(simulation) => {
                     simulation.handle_mouse_release(mouse_button, queue)?;
                 }
-
+                SimulationType::Vectors(_) => {}
                 _ => (),
             }
         }
@@ -858,7 +895,7 @@ impl SimulationManager {
                 SimulationType::Flow(simulation) => {
                     // For Flow, use the existing update_state method
                     simulation.update_state(
-                        "currentLut",
+                        "current_color_scheme",
                         serde_json::json!(color_scheme_name),
                         device,
                         queue,
@@ -867,7 +904,7 @@ impl SimulationManager {
                 SimulationType::Pellets(simulation) => {
                     // For Pellets, use the existing update_state method
                     simulation.update_state(
-                        "currentLut",
+                        "current_color_scheme",
                         serde_json::json!(color_scheme_name),
                         device,
                         queue,
@@ -938,6 +975,25 @@ impl SimulationManager {
                         device,
                         queue,
                     )?;
+                }
+                SimulationType::Vectors(simulation) => {
+                    let mut color_scheme_data = self
+                        .color_scheme_manager
+                        .get(color_scheme_name)
+                        .map_err(|e| {
+                            AppError::ColorScheme(ColorSchemeError::load_failed(
+                                color_scheme_name,
+                                &e.to_string(),
+                            ))
+                        })?;
+
+                    if simulation.state.color_scheme_reversed {
+                        color_scheme_data.reverse();
+                    }
+
+                    let data_u32 = color_scheme_data.to_u32_buffer();
+                    queue.write_buffer(&simulation.lut_buffer, 0, bytemuck::cast_slice(&data_u32));
+                    simulation.state.current_color_scheme = color_scheme_name.to_string();
                 }
             }
         }
@@ -1087,6 +1143,22 @@ impl SimulationManager {
                         queue,
                     )?;
                     tracing::info!("Color scheme reversed for Primordial Particles simulation");
+                }
+                SimulationType::Vectors(simulation) => {
+                    simulation.state.color_scheme_reversed =
+                        !simulation.state.color_scheme_reversed;
+                    if let Ok(lut) = self
+                        .color_scheme_manager
+                        .get(&simulation.state.current_color_scheme)
+                    {
+                        let mut data = lut.to_u32_buffer();
+                        if simulation.state.color_scheme_reversed {
+                            data[0..256].reverse();
+                            data[256..512].reverse();
+                            data[512..768].reverse();
+                        }
+                        queue.write_buffer(&simulation.lut_buffer, 0, bytemuck::cast_slice(&data));
+                    }
                 }
             }
         }
@@ -1382,6 +1454,7 @@ impl SimulationManager {
                 SimulationType::PrimordialParticles(simulation) => {
                     simulation.pan_camera(delta_x, delta_y)
                 }
+                SimulationType::Vectors(simulation) => simulation.pan_camera(delta_x, delta_y),
                 _ => {}
             }
         }
@@ -1399,6 +1472,7 @@ impl SimulationManager {
                 SimulationType::VoronoiCA(simulation) => simulation.camera.zoom(delta),
                 SimulationType::Moire(simulation) => simulation.zoom_camera(delta),
                 SimulationType::PrimordialParticles(simulation) => simulation.zoom_camera(delta),
+                SimulationType::Vectors(simulation) => simulation.zoom_camera(delta),
                 _ => {}
             }
         }
@@ -1432,6 +1506,9 @@ impl SimulationManager {
                 SimulationType::PrimordialParticles(simulation) => {
                     simulation.zoom_camera_to_cursor(delta, cursor_x, cursor_y)
                 }
+                SimulationType::Vectors(simulation) => {
+                    simulation.zoom_camera_to_cursor(delta, cursor_x, cursor_y)
+                }
                 _ => {}
             }
         }
@@ -1449,6 +1526,7 @@ impl SimulationManager {
                 SimulationType::VoronoiCA(simulation) => simulation.camera.reset(),
                 SimulationType::Moire(simulation) => simulation.reset_camera(),
                 SimulationType::PrimordialParticles(simulation) => simulation.reset_camera(),
+                SimulationType::Vectors(simulation) => simulation.reset_camera(),
                 _ => {}
             }
         }
@@ -1467,6 +1545,7 @@ impl SimulationManager {
                 SimulationType::PrimordialParticles(simulation) => {
                     Some(simulation.get_camera_state())
                 }
+                SimulationType::Vectors(simulation) => Some(simulation.get_camera_state()),
                 _ => Some(serde_json::json!({})), // No camera for other simulations
             }
         } else {
@@ -1498,6 +1577,9 @@ impl SimulationManager {
                     simulation.camera.set_smoothing_factor(smoothing_factor)
                 }
                 SimulationType::PrimordialParticles(simulation) => {
+                    simulation.camera.set_smoothing_factor(smoothing_factor)
+                }
+                SimulationType::Vectors(simulation) => {
                     simulation.camera.set_smoothing_factor(smoothing_factor)
                 }
                 _ => {} // No camera for other simulations

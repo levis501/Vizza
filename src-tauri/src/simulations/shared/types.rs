@@ -63,10 +63,11 @@ impl std::str::FromStr for ImageFitMode {
 }
 
 /// Color mode for particle rendering
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BackgroundColorMode {
     Gray18,
     White,
+    #[default]
     Black,
     #[serde(rename = "Color Scheme")]
     ColorScheme,

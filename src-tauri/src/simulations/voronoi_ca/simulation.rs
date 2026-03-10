@@ -645,7 +645,7 @@ impl VoronoiCASimulation {
         // Create LUT buffer with default LUT
         let color_scheme_manager = crate::simulations::shared::ColorSchemeManager::new();
         let default_lut_name = "MATPLOTLIB_YlGnBu".to_string();
-        let lut_data = color_scheme_manager.get(&default_lut_name).unwrap();
+        let lut_data = color_scheme_manager.get(&default_lut_name).expect("Default LUT exists");
         let lut_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("VCA LUT Buffer"),
             contents: bytemuck::cast_slice(&lut_data.to_u32_buffer()),

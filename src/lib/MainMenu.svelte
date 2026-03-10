@@ -117,6 +117,11 @@
             <p>Mathematical moiré patterns with fluid advection and color schemes</p>
         </button>
 
+        <button class="simulation-card" on:click={() => selectSimulation('vectors')}>
+            <h2>Vectors</h2>
+            <p>Noise-based vector field visualization with zoom and pan</p>
+        </button>
+
         <button class="simulation-card" on:click={() => selectSimulation('primordial-particles')}>
             <h2>Primordial Particles</h2>
             <p>Life-like emergence from simple particle motion laws</p>

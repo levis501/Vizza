@@ -50,6 +50,13 @@
             on:back={goBack}
             on:navigate={handleNavigation}
         />
+    {:else if currentMode === 'vectors'}
+        <VectorsMode
+            menuPosition={appSettings.menu_position}
+            autoHideDelay={appSettings.auto_hide_delay}
+            on:back={goBack}
+            on:navigate={handleNavigation}
+        />
     {:else if currentMode === 'primordial-particles'}
         <PrimordialParticlesMode
             menuPosition={appSettings.menu_position}
@@ -90,6 +97,7 @@
     import VoronoiCAMode from './lib/VoronoiCAMode.svelte';
     import MoireMode from './lib/MoireMode.svelte';
     import PrimordialParticlesMode from './lib/PrimordialParticlesMode.svelte';
+    import VectorsMode from './lib/VectorsMode.svelte';
 
     import HowToPlay from './lib/HowToPlay.svelte';
     import Settings from './lib/Settings.svelte';

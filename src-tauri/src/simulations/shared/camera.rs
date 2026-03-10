@@ -63,6 +63,8 @@ pub struct Camera {
     smoothing_factor: f32,
     /// Camera sensitivity multiplier for pan and zoom operations
     sensitivity: f32,
+    /// Optional position clamp; when None, panning is unbounded
+    position_clamp: Option<(f32, f32)>,
 }
 
 impl Camera {
@@ -101,6 +103,7 @@ impl Camera {
             uniform_data,
             smoothing_factor: 0.15, // Smooth camera movement
             sensitivity: 1.0,       // Default sensitivity
+            position_clamp: Some((-2.0, 2.0)),
         })
     }
 
@@ -167,10 +170,10 @@ impl Camera {
         self.target_position[0] += adjusted_delta_x * pan_speed;
         self.target_position[1] += adjusted_delta_y * pan_speed;
 
-        // Clamp target position to reasonable bounds for [-1,1] world space
-        // Allow movement within [-2.0, 2.0] to provide some margin around the [-1,1] space
-        self.target_position[0] = self.target_position[0].clamp(-2.0, 2.0);
-        self.target_position[1] = self.target_position[1].clamp(-2.0, 2.0);
+        if let Some((min, max)) = self.position_clamp {
+            self.target_position[0] = self.target_position[0].clamp(min, max);
+            self.target_position[1] = self.target_position[1].clamp(min, max);
+        }
     }
 
     /// Update zoom level (zooms to center of viewport)
@@ -224,9 +227,10 @@ impl Camera {
         self.target_position[0] += offset_x;
         self.target_position[1] += offset_y;
 
-        // Clamp target position to reasonable bounds to prevent going too far out
-        self.target_position[0] = self.target_position[0].clamp(-2.0, 2.0);
-        self.target_position[1] = self.target_position[1].clamp(-2.0, 2.0);
+        if let Some((min, max)) = self.position_clamp {
+            self.target_position[0] = self.target_position[0].clamp(min, max);
+            self.target_position[1] = self.target_position[1].clamp(min, max);
+        }
     }
 
     /// Reset camera to default position and zoom
@@ -356,5 +360,10 @@ impl Camera {
     /// Get the current camera sensitivity
     pub fn get_sensitivity(&self) -> f32 {
         self.sensitivity
+    }
+
+    /// Set position clamp for panning. Pass None for unbounded panning.
+    pub fn set_position_clamp(&mut self, clamp: Option<(f32, f32)>) {
+        self.position_clamp = clamp;
     }
 }

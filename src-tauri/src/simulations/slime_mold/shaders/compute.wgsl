@@ -36,6 +36,7 @@ struct CursorParams {
     _pad2: u32,
 };
 
+// agents are stored as 4 floats each (x, y, angle, speed)
 @group(0) @binding(0)
 var<storage, read_write> agents: array<vec4<f32>>;
 

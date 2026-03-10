@@ -47,7 +47,7 @@
                 <label for="vcaLutSelector">Color Scheme</label>
                 <ColorSchemeSelector
                     bind:available_color_schemes={available_luts}
-                    current_color_scheme={currentLut}
+                    current_color_scheme={currentColorScheme}
                     reversed={colorSchemeReversed}
                     on:select={({ detail }) => applyLut(detail.name)}
                     on:reverse={() => toggleColorSchemeReversed()}
@@ -288,7 +288,7 @@
 
     // LUT + controls
     let available_luts: string[] = [];
-    let currentLut = 'MATPLOTLIB_bone';
+    let currentColorScheme = 'MATPLOTLIB_bone';
     let colorSchemeReversed = true;
     let coloringMode = 'Density';
     let bordersEnabled = true;
@@ -335,8 +335,8 @@
                         timeScale = settings.timeScale;
                     if (settings && typeof settings.numPoints === 'number')
                         pointCount = settings.numPoints;
-                    if (settings && typeof settings.currentLutName === 'string')
-                        currentLut = settings.currentLutName;
+                    if (settings && typeof settings.currentColorSchemeName === 'string')
+                        currentColorScheme = settings.currentColorSchemeName;
                     if (settings && typeof settings.colorSchemeReversed === 'boolean')
                         colorSchemeReversed = settings.colorSchemeReversed;
                     if (settings && typeof settings.coloringMode === 'string')
@@ -376,7 +376,7 @@
     }
 
     async function applyLut(lutName: string) {
-        currentLut = lutName;
+        currentColorScheme = lutName;
         try {
             await invoke('apply_color_scheme_by_name', { colorSchemeName: lutName });
         } catch (e) {
@@ -487,8 +487,8 @@
                     brownianSpeed = settings.brownianSpeed;
                 if (typeof settings.timeScale === 'number') timeScale = settings.timeScale;
                 if (typeof settings.numPoints === 'number') pointCount = settings.numPoints;
-                if (typeof settings.currentLutName === 'string')
-                    currentLut = settings.currentLutName;
+                if (typeof settings.currentColorSchemeName === 'string')
+                    currentColorScheme = settings.currentColorSchemeName;
                 if (typeof settings.colorSchemeReversed === 'boolean')
                     colorSchemeReversed = settings.colorSchemeReversed;
                 if (typeof settings.coloringMode === 'string') coloringMode = settings.coloringMode;

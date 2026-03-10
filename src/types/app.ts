@@ -9,6 +9,7 @@ export type AppMode =
     | 'voronoi-ca'
     | 'moire'
     | 'primordial-particles'
+    | 'vectors'
     | 'gradient'
     | 'how-to-play'
     | 'settings';

@@ -188,8 +188,7 @@ fn main() {
             // Initialize GPU context
             let gpu_context = tauri::async_runtime::block_on(async {
                 GpuContext::new_with_surface(&window, &app_settings_clone)
-                    .await
-                    .unwrap()
+                    .await.expect("Failed to create GPU context")
             });
 
             app.manage(Arc::new(tokio::sync::Mutex::new(gpu_context)));
@@ -234,6 +233,16 @@ fn main() {
             commands::start_flow_webcam_capture,         // Flow webcam
             commands::stop_flow_webcam_capture,          // Flow webcam
             commands::get_available_flow_webcam_devices, // Flow webcam
+            commands::set_vectors_vector_field_type,     // Vectors
+            commands::set_vectors_image_fit_mode,        // Vectors
+            commands::set_vectors_image_mirror_horizontal, // Vectors
+            commands::set_vectors_image_mirror_vertical,   // Vectors
+            commands::set_vectors_image_invert_tone,     // Vectors
+            commands::load_vectors_vector_field_image,   // Vectors
+            commands::load_vectors_vector_field_image_bytes, // Vectors
+            commands::start_vectors_webcam_capture,      // Vectors webcam
+            commands::stop_vectors_webcam_capture,       // Vectors webcam
+            commands::get_available_vectors_webcam_devices, // Vectors webcam
             commands::update_particle_life_post_processing_state, // Particle Life
             commands::get_particle_life_post_processing_state, // Particle Life
             commands::update_gray_scott_post_processing_state, // Gray Scott

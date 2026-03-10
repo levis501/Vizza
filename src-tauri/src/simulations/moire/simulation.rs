@@ -203,7 +203,7 @@ impl MoireModel {
 
         // Initialize LUT buffer with default color scheme
         let default_lut_name = "ZELDA_Fordite";
-        let default_lut = color_scheme_manager.get(default_lut_name).unwrap();
+        let default_lut = color_scheme_manager.get(default_lut_name).expect("Default LUT exists");
         let lut_data = default_lut.to_u32_buffer();
         let lut_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(&format!("Moiré LUT Buffer for {}", default_lut_name)),

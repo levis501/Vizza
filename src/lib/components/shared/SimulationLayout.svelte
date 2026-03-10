@@ -153,6 +153,7 @@
 
             // Track mouse press state for global mouse up detection
             if (event.type === 'mousedown') {
+                (document.activeElement as HTMLElement | null)?.blur();
                 isMousePressed = true;
                 currentMouseButton = (event as MouseEvent).button;
             } else if (event.type === 'mouseup') {

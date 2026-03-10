@@ -38,6 +38,7 @@ macro_rules! delegate_to_simulation {
             SimulationType::VoronoiCA(simulation) => simulation.$method(),
             SimulationType::Moire(simulation) => simulation.$method(),
             SimulationType::PrimordialParticles(simulation) => simulation.$method(),
+            SimulationType::Vectors(simulation) => simulation.$method(),
         }
     };
     ($self:expr, $method:ident, $($arg:expr),+) => {
@@ -52,6 +53,7 @@ macro_rules! delegate_to_simulation {
             SimulationType::VoronoiCA(simulation) => simulation.$method($($arg),+),
             SimulationType::Moire(simulation) => simulation.$method($($arg),+),
             SimulationType::PrimordialParticles(simulation) => simulation.$method($($arg),+),
+            SimulationType::Vectors(simulation) => simulation.$method($($arg),+),
         }
     };
 }
@@ -239,6 +241,7 @@ pub enum SimulationType {
     VoronoiCA(Box<crate::simulations::voronoi_ca::simulation::VoronoiCASimulation>),
     Moire(Box<crate::simulations::moire::MoireModel>),
     PrimordialParticles(Box<crate::simulations::primordial_particles::PrimordialParticlesModel>),
+    Vectors(Box<crate::simulations::vectors::VectorsModel>),
 }
 
 impl SimulationType {
@@ -384,6 +387,18 @@ impl SimulationType {
                 )?;
                 Ok(SimulationType::PrimordialParticles(Box::new(simulation)))
             }
+            "vectors" => {
+                let settings = crate::simulations::vectors::Settings::default();
+                let simulation = crate::simulations::vectors::VectorsModel::new(
+                    device,
+                    queue,
+                    surface_config,
+                    settings,
+                    app_settings,
+                    color_scheme_manager,
+                )?;
+                Ok(SimulationType::Vectors(Box::new(simulation)))
+            }
             _ => Err(format!("Unknown simulation type: {}", simulation_type).into()),
         }
     }
@@ -438,6 +453,7 @@ impl Simulation for SimulationType {
             SimulationType::PrimordialParticles(simulation) => {
                 simulation.resize(device, queue, new_config)
             }
+            SimulationType::Vectors(simulation) => simulation.resize(device, queue, new_config),
         }
     }
 

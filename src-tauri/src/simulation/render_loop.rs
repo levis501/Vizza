@@ -38,7 +38,7 @@ impl RenderLoopManager {
 
         // Use the main thread for rendering to avoid Metal adapter warnings
         std::thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             runtime.block_on(async move {
                 let mut last_frame_time = Instant::now();
                 let mut frame_count = 0;
