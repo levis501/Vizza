@@ -408,7 +408,22 @@ fn noise_ridged(p: vec3<f32>, seed: u32, octaves: u32) -> f32 {
 /// that breathe as time advances, rather than as rings. That is inherited
 /// behaviour, not a port artefact.
 fn noise_cylinders(p: vec3<f32>) -> f32 {
-    let r = length(vec2<f32>(p.x, p.z));
+    // The radius is taken across the two *spatial* axes, which is a deliberate
+    // divergence from both the crate and the desktop build.
+    //
+    // `noise::Cylinders` is cylinders about the y axis, so its radius is
+    // `length(x, z)` — correct for a 3D field, wrong here, because Vectors
+    // passes the clock as z (`line_instanced.wgsl:228`, matching
+    // `simulation.rs:272`). `length(x, time)` is dominated by `time` within a
+    // few seconds, so the whole field collapses to one spatially-uniform value
+    // that cycles: every line points the same way and sweeps round together.
+    // Confirmed on the desktop-faithful version in a browser.
+    //
+    // Using x and y instead gives concentric rings about the origin, which is
+    // what the name promises. The cost is that Cylinders no longer animates —
+    // correct, since a cylinder is invariant along its own axis, and it already
+    // ignores the seed for the same kind of reason.
+    let r = length(p.xy);
     let inner = r - floor(r);
     let nearest = min(inner, 1.0 - inner);
     return 1.0 - nearest * 4.0;

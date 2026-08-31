@@ -2080,7 +2080,14 @@ test('noise fields are smooth under refinement, not merely correlated', async ()
 test('the noise field advances with the animated third coordinate', async () => {
     // z is time in the Vectors sim, so a field that ignores it would animate
     // nothing while still passing every static assertion above.
+    //
+    // Cylinders is the deliberate exception, and is asserted static below
+    // rather than merely skipped. It takes its radius across x and y so that it
+    // produces rings in space; the version that used z was spatially uniform
+    // within seconds, because `length(x, time)` is dominated by the clock. See
+    // the comment on `noise_cylinders`.
     for (const { code, name } of NOISE_TYPES) {
+        if (name === 'Cylinders') continue;
         const t0 = await sampleNoise(code, 4242, { size: 32, z: 0.13 });
         const t1 = await sampleNoise(code, 4242, { size: 32, z: 1.63 });
         assert(
@@ -2088,6 +2095,23 @@ test('the noise field advances with the animated third coordinate', async () => 
             `${name} does not vary with z, so the simulation would be frozen`
         );
     }
+});
+
+test('Cylinders is static in time and varies in space', async () => {
+    const cylinders = NOISE_TYPES.find((t) => t.name === 'Cylinders');
+    assert(cylinders !== undefined, 'Cylinders is missing from NOISE_TYPES');
+
+    const t0 = await sampleNoise(cylinders.code, 4242, { size: 32, z: 0.13 });
+    const t1 = await sampleNoise(cylinders.code, 4242, { size: 32, z: 9.71 });
+    assert(
+        meanAbsDelta(t0, t1) < 1e-6,
+        'Cylinders must ignore z — a radius mixing the clock in collapses the ' +
+            'whole field to one value that sweeps round together'
+    );
+    assert(
+        Math.max(...t0) - Math.min(...t0) > 1e-6,
+        'Cylinders must still vary across x and y'
+    );
 });
 
 /**
