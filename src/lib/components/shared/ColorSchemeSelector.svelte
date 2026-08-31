@@ -72,8 +72,8 @@
                 <label for="colorSpaceTop">Space</label>
                 <Selector
                     id="colorSpaceTop"
-                    options={['RGB', 'Lab', 'OkLab', 'Jzazbz', 'HSLuv']}
-                    bind:value={selectedColorSpace}
+                    options={COLOR_SPACE_OPTIONS}
+                    bind:value={colorSpaceLabel}
                     on:change={handleColorSpaceChange}
                 />
             </div>
@@ -189,7 +189,11 @@
                             <li>Click on a color stop to select and edit it</li>
                             <li>Drag color stops to reposition them</li>
                             <li>Use the delete button to remove selected stops</li>
-                            <li>Choose a color space for interpolation (RGB, Lab, or OkLab)</li>
+                            <li>
+                                Choose a color space for interpolation ({COLOR_SPACE_OPTIONS.join(
+                                    ', '
+                                )})
+                            </li>
                         </ul>
                     </div>
                 {/if}
@@ -250,6 +254,11 @@
                 </div>
             </div>
 
+            <!-- Why the save was refused — most often a built-in's name -->
+            {#if save_error}
+                <p class="save-error" role="alert">{save_error}</p>
+            {/if}
+
             <!-- Dialog Actions -->
             <div class="dialog-actions">
                 <button
@@ -272,7 +281,30 @@
     import { createEventDispatcher, tick } from 'svelte';
     import { invoke } from '$lib/rpc';
     import Selector from '../inputs/Selector.svelte';
-    import { interpolate, formatHex } from 'culori';
+    import {
+        DEFAULT_GRADIENT_COLOR_SPACE,
+        GRADIENT_COLOR_SPACES,
+        GRADIENT_COLOR_SPACE_LABELS,
+        buildGradientLut,
+        parseGradientColorSpace,
+        sampleGradient,
+        type GradientColorSpace,
+    } from '$lib/engine/color/spaces';
+
+    /**
+     * The one list of colour spaces, shared with GradientEditorMode.svelte.
+     *
+     * The five this picker used to offer were not five: `Jzazbz` and `HSLuv`
+     * were mapped to the culori mode names `'jzazbz'` and `'hsluv'`, and culori
+     * registers neither (it ships `jab` and `lchuv`). Picking either threw
+     * `TypeError: converters[color.mode].rgb is not a function` inside
+     * `updateGradientPreview`, where the catch turned it into a `console.error`
+     * — so the gradient silently stopped updating, in all nine modes that mount
+     * this component.
+     */
+    const COLOR_SPACE_OPTIONS = GRADIENT_COLOR_SPACES.map(
+        (space) => GRADIENT_COLOR_SPACE_LABELS[space]
+    );
 
     // Portal the dialog to document.body so it is not clipped by parent containers
     function portalToBody(node: HTMLElement) {
@@ -308,7 +340,13 @@
     let dragStopIndex = -1;
     let original_color_scheme_name = ''; // Store the original color scheme name to restore on cancel
     let isAddingStop = false; // Flag to track when a new stop is being added
-    let selectedColorSpace: 'RGB' | 'Lab' | 'OkLab' | 'Jzazbz' | 'HSLuv' = 'OkLab'; // Default to OkLab for better perceptual uniformity
+    // OkLab by default, for perceptual uniformity — the default both editors
+    // already used, now named once in engine/color/spaces.ts.
+    let selectedColorSpace: GradientColorSpace = DEFAULT_GRADIENT_COLOR_SPACE;
+    // The <Selector> shows display names; `selectedColorSpace` is the canonical
+    // id. A separate binding because `bind:value` writes back into it.
+    let colorSpaceLabel = GRADIENT_COLOR_SPACE_LABELS[selectedColorSpace];
+    let save_error = '';
     let selectedPreset = 'Custom';
     let selectedRandomScheme: string = 'Basic';
     let randomStopPlacement: 'Even' | 'Random' = 'Random';
@@ -338,6 +376,7 @@
     // Function to open gradient editor and apply initial gradient
     async function openGradientEditor() {
         original_color_scheme_name = current_color_scheme; // Store the original color scheme name
+        save_error = '';
         show_gradient_editor = true;
 
         // Apply the initial gradient preview immediately
@@ -348,6 +387,7 @@
     async function closeGradientEditor() {
         show_gradient_editor = false;
         custom_color_scheme_name = '';
+        save_error = '';
 
         try {
             // Restore the original color scheme to ensure it's properly applied
@@ -415,67 +455,27 @@
         updateGradientPreview();
     }
 
-    function getColorAtPosition(position: number): string {
-        // Find the two stops that bound this position
-        let leftStop = gradientStops[0];
-        let rightStop = gradientStops[gradientStops.length - 1];
-
-        for (let i = 0; i < gradientStops.length - 1; i++) {
-            if (
-                gradientStops[i].position <= position &&
-                gradientStops[i + 1].position >= position
-            ) {
-                leftStop = gradientStops[i];
-                rightStop = gradientStops[i + 1];
-                break;
-            }
-        }
-
-        // Interpolate or step between the two colors
-        const t = (position - leftStop.position) / (rightStop.position - leftStop.position);
-        if (interpolationMode === 'Stepped') return leftStop.color;
-        return interpolateColor(leftStop.color, rightStop.color, t);
+    /** What `sampleGradient` and `buildGradientLut` need from this editor. */
+    function gradientOptions() {
+        return { space: selectedColorSpace, mode: interpolationMode };
     }
 
-    // Simplified color interpolation using culori
-    function interpolateColor(color1: string, color2: string, t: number): string {
-        let colorSpace = 'rgb';
-
-        switch (selectedColorSpace) {
-            case 'RGB':
-                colorSpace = 'rgb';
-                break;
-            case 'Lab':
-                colorSpace = 'lab';
-                break;
-            case 'OkLab':
-                colorSpace = 'oklab';
-                break;
-            case 'Jzazbz':
-                colorSpace = 'jzazbz';
-                break;
-            case 'HSLuv':
-                colorSpace = 'hsluv';
-                break;
-            default:
-                throw new Error(`Unsupported color space: ${selectedColorSpace}`);
-        }
-
-        // Create interpolator
-        const interpolator = interpolate([color1, color2], colorSpace);
-        const result = interpolator(t);
-
-        if (!result) {
-            throw new Error(`Failed to interpolate colors in ${colorSpace} color space`);
-        }
-
-        // Convert result to hex
-        const hexResult = formatHex(result);
-        if (!hexResult) {
-            throw new Error(`Failed to convert interpolated color to hex format`);
-        }
-
-        return hexResult;
+    /**
+     * `sampleGradient` (engine/color/spaces.ts:511) implements
+     * GradientEditorMode's semantics, which are the correct ones. This copy
+     * differed in two ways, and both baked different bytes than the other
+     * editor from the same stops:
+     *
+     *  - It neither clamped `position` nor held the terminal colour outside the
+     *    stop range. When no pair bracketed the position the loop left the
+     *    bracket at the first and last stops and **extrapolated** with `t`
+     *    outside [0,1] — reachable simply by dragging a handle inward so the
+     *    stops no longer reach 0 and 1.
+     *  - Two coincident stops (drag one handle onto another) divided by zero,
+     *    so `t` was NaN and the whole LUT was poisoned.
+     */
+    function getColorAtPosition(position: number): string {
+        return sampleGradient(gradientStops, position, gradientOptions());
     }
 
     // Reverse entire gradient
@@ -486,20 +486,19 @@
         updateGradientPreview();
     }
 
-    // Export color scheme as .lut text file
+    /**
+     * Download the current gradient as a real `.lut` file.
+     *
+     * Was 768 values written *interleaved* (`r,g,b,r,g,b…`) as newline-
+     * separated text under a `.lut` name — neither the planar order nor the
+     * binary format of the 167 files in `src-tauri/src/simulations/shared/LUTs/`,
+     * so nothing in either build could read back what this button produced.
+     */
     function exportColorScheme() {
-        const lutData: number[] = [];
-        for (let i = 0; i < 256; i++) {
-            const t = i / 255;
-            const color = getColorAtPosition(t);
-            const r = parseInt(color.slice(1, 3), 16);
-            const g = parseInt(color.slice(3, 5), 16);
-            const b = parseInt(color.slice(5, 7), 16);
-            lutData.push(r, g, b);
-        }
-        const dataStr = lutData.join('\n');
-        const dataBlob = new Blob([dataStr], { type: 'text/plain' });
-        const url = URL.createObjectURL(dataBlob);
+        const blob = new Blob([buildGradientLut(gradientStops, gradientOptions())], {
+            type: 'application/octet-stream',
+        });
+        const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
         link.download = `${custom_color_scheme_name || 'custom'}.lut`;
@@ -800,26 +799,14 @@
         document.addEventListener('mouseup', handleMouseUp);
     }
 
+    /** The current gradient as the 768 planar bytes every command here wants. */
+    function currentLutData(): number[] {
+        return Array.from(buildGradientLut(gradientStops, gradientOptions()));
+    }
+
     async function updateGradientPreview() {
         try {
-            // Build color scheme in [r0..r255, g0..g255, b0..b255] format for preview, as integers 0-255
-            const rArr: number[] = [];
-            const gArr: number[] = [];
-            const bArr: number[] = [];
-            for (let i = 0; i < 256; i++) {
-                const t = i / 255;
-                const interpolatedColor = getColorAtPosition(t);
-
-                const r = parseInt(interpolatedColor.slice(1, 3), 16);
-                const g = parseInt(interpolatedColor.slice(3, 5), 16);
-                const b = parseInt(interpolatedColor.slice(5, 7), 16);
-                rArr.push(r);
-                gArr.push(g);
-                bArr.push(b);
-            }
-            const lutData = [...rArr, ...gArr, ...bArr];
-
-            await invoke('update_gradient_preview', { colorSchemeData: lutData });
+            await invoke('update_gradient_preview', { colorSchemeData: currentLutData() });
         } catch (e) {
             console.error('Failed to update gradient preview:', e);
         }
@@ -827,32 +814,21 @@
 
     async function saveCustomColorScheme() {
         if (!custom_color_scheme_name.trim()) return;
+        save_error = '';
         try {
-            // Build color scheme in [r0..r255, g0..g255, b0..b255] format as integers
-            const rArr: number[] = [];
-            const gArr: number[] = [];
-            const bArr: number[] = [];
-            for (let i = 0; i < 256; i++) {
-                const t = i / 255;
-                const interpolatedColor = getColorAtPosition(t);
-                const r = parseInt(interpolatedColor.slice(1, 3), 16);
-                const g = parseInt(interpolatedColor.slice(3, 5), 16);
-                const b = parseInt(interpolatedColor.slice(5, 7), 16);
-                rArr.push(r);
-                gArr.push(g);
-                bArr.push(b);
-            }
-            const lutData = [...rArr, ...gArr, ...bArr];
-            await invoke('save_custom_color_scheme', {
+            // `save_custom_color_scheme` answers with the name the scheme was
+            // actually stored under — trimmed — and that is the name the picker
+            // will list, so select by it rather than by the raw input.
+            const savedName = (await invoke('save_custom_color_scheme', {
                 name: custom_color_scheme_name,
-                colorSchemeData: lutData,
-            });
+                colorSchemeData: currentLutData(),
+            })) as string;
 
             // Update current color scheme to the newly saved one
-            current_color_scheme = custom_color_scheme_name;
+            current_color_scheme = savedName;
 
             // Notify parent component about the color scheme change
-            dispatch('select', { name: custom_color_scheme_name });
+            dispatch('select', { name: savedName });
 
             // Close the editor without restoring the original color scheme
             show_gradient_editor = false;
@@ -861,12 +837,21 @@
             // Refresh available color schemes to include the new one
             available_color_schemes = await invoke('get_available_color_schemes');
         } catch (e) {
-            console.error('Failed to save custom color scheme:', e);
+            // Shown in the dialog rather than logged: the failure a user can
+            // provoke here is `saveCustom` refusing a built-in's name
+            // (ColorSchemeManager.ts:264), and the dialog stays open so they can
+            // rename and keep their work. A console.error would both hide the
+            // reason from them and make a refusal look like a fault.
+            save_error = e instanceof Error ? e.message : `Failed to save colour scheme: ${e}`;
         }
     }
 
     function handleColorSpaceChange({ detail }: { detail: { value: string } }) {
-        selectedColorSpace = detail.value as 'RGB' | 'Lab' | 'OkLab' | 'Jzazbz' | 'HSLuv';
+        // Through the parser rather than a cast: it folds every spelling either
+        // editor has ever stored — `OkLab`, `jab`, `hsluv` — onto the canonical
+        // set, so nothing can leave the <Selector> showing nothing selected.
+        selectedColorSpace = parseGradientColorSpace(detail.value);
+        colorSpaceLabel = GRADIENT_COLOR_SPACE_LABELS[selectedColorSpace];
         updateGradientPreview();
     }
 
@@ -1158,6 +1143,16 @@
         margin: 0.3rem 0;
         color: #333;
         line-height: 1.4;
+    }
+
+    .save-error {
+        margin: 0.75rem 0 0 0;
+        padding: 0.5rem 0.75rem;
+        border-radius: 6px;
+        background: rgba(220, 53, 69, 0.2);
+        border: 1px solid #dc3545;
+        color: #ffb3ba;
+        font-size: 0.9rem;
     }
 
     .dialog-actions {

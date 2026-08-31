@@ -31,10 +31,10 @@
         </div>
     </div>
 
-    <!-- Success Message -->
-    {#if saveSuccessMessage}
-        <div class="success-message">
-            {saveSuccessMessage}
+    <!-- Save outcome — success or the reason the save was refused -->
+    {#if saveMessage}
+        <div class="save-message" class:failed={saveFailed} role="status">
+            {saveMessage}
         </div>
     {/if}
 
@@ -83,12 +83,17 @@
                 </div>
                 <div class="preset-section">
                     <label for="preset-selector">Preset:</label>
+                    <!-- 'Heat', not 'Warm': `applyPreset` has always switched on
+                    'Heat' (and ColorSchemeSelector.svelte:64 offers that
+                    spelling), so the 'Warm' option here matched no arm and
+                    selecting it cleared the stop selection without changing a
+                    single stop. -->
                     <Selector
                         id="preset-selector"
                         options={[
                             'Custom',
                             'Rainbow',
-                            'Warm',
+                            'Heat',
                             'Cool',
                             'Viridis',
                             'Plasma',
@@ -102,8 +107,8 @@
                     <label for="color-space-selector">Color Space:</label>
                     <Selector
                         id="color-space-selector"
-                        options={['rgb', 'lab', 'oklab', 'jab', 'lchuv']}
-                        bind:value={selectedColorSpace}
+                        options={COLOR_SPACE_OPTIONS}
+                        bind:value={colorSpaceLabel}
                         on:change={handleColorSpaceChange}
                     />
                 </div>
@@ -249,16 +254,43 @@
     import SimulationLayout from './components/shared/SimulationLayout.svelte';
     import CameraControls from './components/shared/CameraControls.svelte';
     import Selector from './components/inputs/Selector.svelte';
-    import { interpolate, formatHex } from 'culori';
+    import {
+        DEFAULT_GRADIENT_COLOR_SPACE,
+        GRADIENT_COLOR_SPACES,
+        GRADIENT_COLOR_SPACE_LABELS,
+        buildGradientLut,
+        parseGradientColorSpace,
+        sampleGradient,
+        type GradientColorSpace,
+    } from '$lib/engine/color/spaces';
     // import { createSyncManager } from './utils/sync';
 
     const dispatch = createEventDispatcher();
 
     export let autoHideDelay: number = 3000;
 
+    /**
+     * The one list of colour spaces, shared with ColorSchemeSelector.svelte.
+     *
+     * Both files used to carry their own: this one offered culori's `jab` and
+     * `lchuv` (which work but have no counterpart in gradient.wgsl), while
+     * ColorSchemeSelector.svelte:75 offered `Jzazbz` and `HSLuv` mapped onto
+     * culori mode names culori does not register — so two of its five spaces
+     * threw `converters[color.mode].rgb is not a function` in all nine modes.
+     * Deriving both pickers from `GRADIENT_COLOR_SPACES` is what stops them
+     * drifting apart again.
+     */
+    const COLOR_SPACE_OPTIONS = GRADIENT_COLOR_SPACES.map(
+        (space) => GRADIENT_COLOR_SPACE_LABELS[space]
+    );
+
     // State variables
     let colorSchemeName = '';
-    let selectedColorSpace: 'rgb' | 'lab' | 'oklab' | 'jab' | 'lchuv' = 'oklab';
+    let selectedColorSpace: GradientColorSpace = DEFAULT_GRADIENT_COLOR_SPACE;
+    // The <Selector> shows display names; `selectedColorSpace` is the canonical
+    // id. Kept as its own binding rather than a `$:` derivation because
+    // `bind:value` writes back into whatever it is given.
+    let colorSpaceLabel = GRADIENT_COLOR_SPACE_LABELS[selectedColorSpace];
     let selectedPreset = 'Custom';
     let selectedDisplayMode = 'Smooth';
     let interpolationMode: 'Smooth' | 'Stepped' = 'Smooth';
@@ -274,12 +306,26 @@
     let dragStopIndex = -1;
     let updateTimeout: number | null = null;
     let unlistenSimulationInitialized: (() => void) | null = null;
-    let saveSuccessMessage = '';
-    let saveSuccessTimeout: number | null = null;
+    let saveMessage = '';
+    let saveFailed = false;
+    let saveMessageTimeout: number | null = null;
+    /**
+     * Set by `onDestroy`, checked by everything asynchronous.
+     *
+     * `updateGradient` is debounced 50 ms, so leaving a fresh edit and hitting
+     * "Back to Menu" fired `update_gradient_preview` *after* the mode had torn
+     * its simulation down. Clearing the timer covers the common case; the flag
+     * covers the one where the timer has already fired and is sitting in an
+     * `await`.
+     */
+    let destroyed = false;
 
     // Simulation control state
     let running = false;
-    const loading = false;
+    // True until `start_simulation` settles, as in every other mode — and
+    // cleared in the failure path too, or a browser with no WebGPU is left
+    // behind an overlay that swallows the "Back to Menu" click (M2 defect 3).
+    let loading = true;
     let showUI = true;
     const currentFps = 0;
     let controlsVisible = true;
@@ -291,25 +337,19 @@
     // Create sync manager for type-safe backend synchronization (not used in this mode)
     // const syncManager = createSyncManager<any, any>();
 
-    // Simplified color interpolation functions using culori
-    function interpolateColor(color1: string, color2: string, t: number): string {
-        // Create interpolator using the selected color space directly
-        const interpolator = interpolate([color1, color2], selectedColorSpace);
-        const result = interpolator(t);
-
-        // Convert result to hex
-        const hexResult = formatHex(result);
-        if (!hexResult) {
-            throw new Error(
-                `Failed to format color result for interpolation between ${color1} and ${color2} in ${selectedColorSpace} space`
-            );
-        }
-
-        return hexResult;
+    /** What `sampleGradient` and `buildGradientLut` need from this editor. */
+    function gradientOptions() {
+        return { space: selectedColorSpace, mode: interpolationMode };
     }
 
     // Event handlers
-    function handleColorSpaceChange() {
+    function handleColorSpaceChange({ detail }: { detail: { value: string } }) {
+        // Through the parser rather than a cast: it folds every spelling either
+        // editor has ever stored onto the canonical set, so a display name, a
+        // legacy `jab`, or a stored `lchuv` all land somewhere real instead of
+        // leaving the <Selector> showing nothing.
+        selectedColorSpace = parseGradientColorSpace(detail.value);
+        colorSpaceLabel = GRADIENT_COLOR_SPACE_LABELS[selectedColorSpace];
         updateGradient();
     }
 
@@ -405,40 +445,15 @@
         document.addEventListener('mouseup', handleMouseUp);
     }
 
+    /**
+     * `sampleGradient` (engine/color/spaces.ts:511) is a port of exactly what
+     * this function used to do — clamp, hold the terminal colour outside the
+     * stop range, binary-search the bracketing pair — plus the guard the
+     * hand-rolled version lacked: two stops dragged onto each other divided by
+     * zero and handed culori a `t` of NaN, which baked a poisoned LUT.
+     */
     function getColorAtPosition(position: number): string {
-        // Clamp position to [0, 1]
-        position = Math.max(0, Math.min(1, position));
-
-        // Handle edge cases quickly
-        if (position <= gradientStops[0].position) {
-            return gradientStops[0].color;
-        }
-        if (position >= gradientStops[gradientStops.length - 1].position) {
-            return gradientStops[gradientStops.length - 1].color;
-        }
-
-        // Binary search for better performance with many stops
-        let left = 0;
-        let right = gradientStops.length - 1;
-
-        while (right - left > 1) {
-            const mid = Math.floor((left + right) / 2);
-            if (gradientStops[mid].position <= position) {
-                left = mid;
-            } else {
-                right = mid;
-            }
-        }
-
-        const leftStop = gradientStops[left];
-        const rightStop = gradientStops[right];
-        const t = (position - leftStop.position) / (rightStop.position - leftStop.position);
-
-        if (interpolationMode === 'Stepped') {
-            return leftStop.color;
-        }
-
-        return interpolateColor(leftStop.color, rightStop.color, t);
+        return sampleGradient(gradientStops, position, gradientOptions());
     }
 
     // Immediate visual update during dragging (no backend call)
@@ -463,35 +478,9 @@
         updateGradient();
     }
 
-    // Generate LUT data from current gradient stops
+    /** The 768-byte planar LUT for the current stops. */
     function generateLutData(): Uint8Array {
-        const rArr: number[] = [];
-        const gArr: number[] = [];
-        const bArr: number[] = [];
-
-        for (let i = 0; i < 256; i++) {
-            const t = i / 255;
-            const color = getColorAtPosition(t);
-            const r = Math.round(parseInt(color.slice(1, 3), 16));
-            const g = Math.round(parseInt(color.slice(3, 5), 16));
-            const b = Math.round(parseInt(color.slice(5, 7), 16));
-
-            // Ensure values are valid integers in 0-255 range
-            const rClamped = Math.max(0, Math.min(255, r));
-            const gClamped = Math.max(0, Math.min(255, g));
-            const bClamped = Math.max(0, Math.min(255, b));
-
-            rArr.push(rClamped);
-            gArr.push(gClamped);
-            bArr.push(bClamped);
-        }
-
-        // Create planar format: [r0, r1, ..., r255, g0, g1, ..., g255, b0, b1, ..., b255]
-        const result = new Uint8Array(768);
-        result.set(rArr, 0);
-        result.set(gArr, 256);
-        result.set(bArr, 512);
-        return result;
+        return buildGradientLut(gradientStops, gradientOptions());
     }
 
     async function updateGradient() {
@@ -499,14 +488,18 @@
         if (updateTimeout) {
             clearTimeout(updateTimeout);
         }
+        if (destroyed) return;
 
         // Debounce the LUT update to avoid too many rapid calls
-        updateTimeout = setTimeout(async () => {
+        updateTimeout = window.setTimeout(async () => {
+            updateTimeout = null;
+            // The timer is cleared in onDestroy, but a rebuild already in
+            // flight when the user leaves would still push a LUT at a
+            // simulation that no longer exists.
+            if (destroyed) return;
             try {
-                const lutData = generateLutData();
-
                 // Convert Uint8Array to regular array for proper serialization
-                const lutDataArray = Array.from(lutData);
+                const lutDataArray = Array.from(generateLutData());
 
                 // Single optimized call to update gradient preview
                 await invoke('update_gradient_preview', { colorSchemeData: lutDataArray });
@@ -747,71 +740,57 @@
         updateGradient();
     }
 
+    /** Show `text` for three seconds, replacing whatever is on screen. */
+    function showSaveMessage(text: string, failed: boolean) {
+        if (saveMessageTimeout) clearTimeout(saveMessageTimeout);
+        saveMessage = text;
+        saveFailed = failed;
+        saveMessageTimeout = window.setTimeout(() => {
+            saveMessage = '';
+            saveFailed = false;
+        }, 3000);
+    }
+
     async function saveColorScheme() {
         if (!colorSchemeName.trim()) return;
         try {
-            const rArr: number[] = [];
-            const gArr: number[] = [];
-            const bArr: number[] = [];
-
-            for (let i = 0; i < 256; i++) {
-                const t = i / 255;
-                const color = getColorAtPosition(t);
-                const r = parseInt(color.slice(1, 3), 16);
-                const g = parseInt(color.slice(3, 5), 16);
-                const b = parseInt(color.slice(5, 7), 16);
-                rArr.push(r);
-                gArr.push(g);
-                bArr.push(b);
-            }
-
-            const lutData = [...rArr, ...gArr, ...bArr];
-            await invoke('save_custom_color_scheme', {
+            const lutData = Array.from(generateLutData());
+            // `save_custom_color_scheme` answers with the name the scheme was
+            // actually stored under — trimmed — and that is the name the picker
+            // will list, so select by it rather than by the raw input.
+            const savedName = (await invoke('save_custom_color_scheme', {
                 name: colorSchemeName,
                 colorSchemeData: lutData,
-            });
+            })) as string;
 
             // Update the gradient simulation with the new LUT
-            await invoke('apply_color_scheme_by_name', { colorSchemeName: colorSchemeName });
+            await invoke('apply_color_scheme_by_name', { colorSchemeName: savedName });
 
-            // Clear any existing timeout
-            if (saveSuccessTimeout) {
-                clearTimeout(saveSuccessTimeout);
-            }
-
-            // Show success message
-            saveSuccessMessage = `LUT "${colorSchemeName}" saved successfully!`;
-            saveSuccessTimeout = setTimeout(() => {
-                saveSuccessMessage = '';
-            }, 3000); // Hide after 3 seconds
+            showSaveMessage(`LUT "${savedName}" saved successfully!`, false);
         } catch (e) {
-            console.error('Failed to save LUT:', e);
-            // Clear any existing timeout
-            if (saveSuccessTimeout) {
-                clearTimeout(saveSuccessTimeout);
-            }
-            // Show error message
-            saveSuccessMessage = 'Failed to save LUT';
-            saveSuccessTimeout = setTimeout(() => {
-                saveSuccessMessage = '';
-            }, 3000);
+            // Reported on screen and *not* to the console: the one failure a
+            // user can actually provoke here is `saveCustom` refusing a
+            // built-in's name (ColorSchemeManager.ts:264), which is a message
+            // to read and act on, not a program error. Logging it would also
+            // make the refusal indistinguishable from a real fault in a
+            // console-clean E2E run.
+            showSaveMessage(e instanceof Error ? e.message : `Failed to save LUT: ${e}`, true);
         }
     }
 
+    /**
+     * Download the current gradient as a real `.lut` file.
+     *
+     * This used to write the 768 values *interleaved* (`r,g,b,r,g,b…`) as
+     * newline-separated text, so the file it produced could not be loaded back
+     * by either build: every `.lut` in `src-tauri/src/simulations/shared/LUTs/`
+     * is exactly 768 raw bytes in planar `[R×256][G×256][B×256]` order, which
+     * is what `buildGradientLut` returns and what `ColorScheme.fromBytes`
+     * reads.
+     */
     function exportLUT() {
-        const lutData = [];
-        for (let i = 0; i < 256; i++) {
-            const t = i / 255;
-            const color = getColorAtPosition(t);
-            const r = parseInt(color.slice(1, 3), 16);
-            const g = parseInt(color.slice(3, 5), 16);
-            const b = parseInt(color.slice(5, 7), 16);
-            lutData.push(r, g, b);
-        }
-
-        const dataStr = lutData.join('\n');
-        const dataBlob = new Blob([dataStr], { type: 'text/plain' });
-        const url = URL.createObjectURL(dataBlob);
+        const blob = new Blob([generateLutData()], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
         link.download = `${colorSchemeName || 'custom'}.lut`;
@@ -959,6 +938,7 @@
 
             // Start gradient simulation
             await invoke('start_simulation', { simulationType: 'gradient' });
+            running = true;
 
             // Add event listeners for auto-hide functionality (excluding keydown to avoid conflicts with CameraControls)
             const events = ['mousedown', 'mousemove', 'wheel', 'touchstart'];
@@ -967,10 +947,20 @@
             });
         } catch (e) {
             console.error('Failed to start gradient simulation:', e);
+        } finally {
+            loading = false;
         }
     });
 
     onDestroy(async () => {
+        // Before the await: everything below runs a microtask later, and the
+        // debounced rebuild is 50 ms out.
+        destroyed = true;
+        if (updateTimeout) {
+            clearTimeout(updateTimeout);
+            updateTimeout = null;
+        }
+
         try {
             await invoke('destroy_simulation');
         } catch (error) {
@@ -990,6 +980,9 @@
         // Clear any remaining timeouts
         if (hideTimeout) {
             clearTimeout(hideTimeout);
+        }
+        if (saveMessageTimeout) {
+            clearTimeout(saveMessageTimeout);
         }
     });
 </script>
@@ -1343,7 +1336,7 @@
         background: #444;
     }
 
-    .success-message {
+    .save-message {
         position: fixed;
         top: 20px;
         left: 50%;
@@ -1355,6 +1348,13 @@
         z-index: 1001; /* Above other content */
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
         animation: fadeInOut 3s ease-in-out;
+        max-width: min(640px, 90vw);
+        text-align: center;
+    }
+
+    /* A refused save — most often a name that collides with a built-in. */
+    .save-message.failed {
+        background-color: #dc3545;
     }
 
     @keyframes fadeInOut {

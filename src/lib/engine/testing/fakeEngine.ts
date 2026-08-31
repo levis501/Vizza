@@ -32,6 +32,7 @@ import {
     updateGrayScottSetting,
     updateGrayScottState,
 } from '$lib/engine/sims/grayScott/settings';
+import { GRADIENT_DISPLAY_MODE, parseGradientDisplayMode } from '$lib/engine/sims/gradient';
 import {
     defaultVectorsSettings,
     defaultVectorsState,
@@ -133,6 +134,35 @@ const MODELS: Record<string, SettingsModel> = {
                 value
             ),
     },
+    /**
+     * Gradient has no settings at all — `update_setting` is an unconditional
+     * `Ok(())` in the Rust (gradient/simulation.rs:308) and a no-op here
+     * (sims/gradient/index.ts:286) — and exactly one state field. Modelling it
+     * rather than falling through to PERMISSIVE is what lets the editor's
+     * display-mode toggle be asserted as reaching the engine *with the value
+     * the shader would take*: `parseGradientDisplayMode` clamps anything that
+     * is not `dithered` to `smooth`, so a control sending a string or an
+     * out-of-range number shows up in the log as the mode it really selected.
+     */
+    gradient: {
+        defaults: () => ({}),
+        update: () => {},
+        normalize: () => ({}),
+        state: () => ({ display_mode: GRADIENT_DISPLAY_MODE.smooth }),
+        updateState: (state, name, value) => {
+            // Both spellings, for the reason sims/gradient/index.ts:300 gives:
+            // the Rust matches on `displayMode` while `get_state` serialises
+            // `display_mode`.
+            if (name === 'display_mode' || name === 'displayMode') {
+                state.display_mode = parseGradientDisplayMode(value);
+                return;
+            }
+            // The real simulation warns and carries on; a throw here would turn
+            // an unknown state name into a rejected promise the modes do not
+            // expect from this simulation.
+            console.warn(`Unknown state parameter for Gradient: ${name}`);
+        },
+    },
     vectors: {
         defaults: () => defaultVectorsSettings() as unknown as Record<string, unknown>,
         update: (settings, name, value) =>
@@ -157,6 +187,27 @@ const MODELS: Record<string, SettingsModel> = {
     },
 };
 
+/**
+ * FNV-1a over a LUT, so a test can tell *which* colour scheme arrived.
+ *
+ * The log has to stay JSON-serialisable — Playwright reads it through
+ * `page.evaluate`, and 768 numbers per entry would make every assertion failure
+ * unreadable — but "a LUT arrived" is too weak on its own. The gradient
+ * editor's colour-space picker is the case in point: every space produces a
+ * 768-entry buffer, and the regression being guarded against is two of them
+ * throwing before they get here. One number distinguishes them.
+ */
+function fnv1a(values: Uint32Array): number {
+    let hash = 0x811c9dc5;
+    for (const value of values) {
+        hash = Math.imul(hash ^ (value & 0xff), 0x01000193);
+        hash = Math.imul(hash ^ ((value >>> 8) & 0xff), 0x01000193);
+        hash = Math.imul(hash ^ ((value >>> 16) & 0xff), 0x01000193);
+        hash = Math.imul(hash ^ (value >>> 24), 0x01000193);
+    }
+    return hash >>> 0;
+}
+
 export class FakeEngine implements EngineContext {
     private simulationId: string | null = null;
     private settings: Record<string, unknown> = {};
@@ -174,6 +225,12 @@ export class FakeEngine implements EngineContext {
 
     private record(command: string, args: unknown): void {
         this.log.push({ command, args });
+    }
+
+    /** The host's own precondition, so the fake refuses what it would refuse. */
+    private requireSimulation(): string {
+        if (!this.simulationId) throw new Error('No simulation is running');
+        return this.simulationId;
     }
 
     currentSimulation(): string | null {
@@ -326,8 +383,16 @@ export class FakeEngine implements EngineContext {
     }
 
     updateColorScheme(lut: Uint32Array, reversed: boolean): void {
+        // As `SimulationHost.updateColorScheme` does, through
+        // `requireSimulation()` (SimulationHost.ts:401). Faithful rather than
+        // lenient because the caller that gets this wrong is real: the gradient
+        // editor's debounced preview lands after the user has navigated away
+        // and the simulation has been torn down, and a fake that quietly
+        // accepted the push would let that regress invisibly at the one layer
+        // that can see it.
+        this.requireSimulation();
         this.state.color_scheme_reversed = reversed;
-        this.record('update_color_scheme', { length: lut.length, reversed });
+        this.record('update_color_scheme', { length: lut.length, reversed, checksum: fnv1a(lut) });
     }
 
     async loadImage(file: File, slot: string): Promise<void> {

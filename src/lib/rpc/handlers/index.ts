@@ -13,6 +13,7 @@ import { registerSettingsHandlers } from './settings';
 import { registerColorSchemeHandlers } from './colorSchemes';
 import { registerPresetHandlers } from './presets';
 import { registerImageHandlers } from './images';
+import { registerGradientHandlers } from './gradient';
 
 let installed = false;
 
@@ -26,6 +27,7 @@ export function installHandlers(): void {
     registerColorSchemeHandlers();
     registerPresetHandlers();
     registerImageHandlers();
+    registerGradientHandlers();
 }
 
 export { setPointerCanvas };

@@ -121,9 +121,22 @@ export class ColorSchemeManager {
         this.builtinIndex = new Map(index.names.map((name, i) => [name, i]));
     }
 
-    /** Sorted built-in + custom names, as `all_color_schemes` returned them. */
+    /**
+     * Sorted built-in + custom names, as `all_color_schemes` returned them —
+     * but deduplicated.
+     *
+     * `color_scheme.rs:137` concatenates the two sets and sorts without
+     * checking for collisions, so a custom `~/Vizza/LUTs/MATPLOTLIB_bone.lut`
+     * makes the desktop picker list that name twice, with the second entry
+     * unreachable because `get` (color_scheme.rs:152) always answers from the
+     * embedded set. `saveCustom` refuses to create such a collision now, but a
+     * document written by an earlier build can still hold one, and one bad
+     * entry must not put a duplicate into a 167-item `<Selector>`.
+     */
     allColorSchemes(): string[] {
-        return [...this.builtinNames, ...this.custom.keys()].sort();
+        const names = new Set(this.builtinNames);
+        for (const name of this.custom.keys()) names.add(name);
+        return [...names].sort();
     }
 
     allCustomNames(): string[] {
@@ -132,6 +145,16 @@ export class ColorSchemeManager {
 
     has(name: string): boolean {
         return this.builtinIndex.has(name) || this.custom.has(name);
+    }
+
+    /** True for one of the 167 packed schemes. */
+    isBuiltin(name: string): boolean {
+        return this.builtinIndex.has(name);
+    }
+
+    /** True for a scheme the user saved from the gradient editor. */
+    isCustom(name: string): boolean {
+        return this.custom.has(name);
     }
 
     /**
@@ -149,6 +172,15 @@ export class ColorSchemeManager {
 
         const customData = this.custom.get(name);
         if (customData) return ColorScheme.fromBytes(name, customData);
+
+        // `saveCustom` trims, but ColorSchemeSelector.svelte:850 sets
+        // `current_color_scheme` from the raw <input> and then applies it by
+        // name, so a name typed with a trailing space would be saved and then
+        // immediately fail to load. Retry trimmed rather than making the user
+        // guess.
+        const trimmed = name.trim();
+        const trimmedData = trimmed === name ? undefined : this.custom.get(trimmed);
+        if (trimmedData) return ColorScheme.fromBytes(trimmed, trimmedData);
 
         throw new Error(
             this.loaded
@@ -215,22 +247,58 @@ export class ColorSchemeManager {
      * planar order, so accept any ArrayLike. Throws `StorageError` when the
      * quota is full — 1 KB per scheme, so this only bites once presets have
      * eaten the budget, but it must not fail silently.
+     *
+     * **A built-in's name is refused.** `PresetStore.list` (PresetStore.ts:180)
+     * handles the same collision by letting the built-in win and silently
+     * skipping the user's entry, which is faithful to `load_user_presets`; the
+     * precedence is right, but silence is not right *here*. A preset is saved
+     * from a panel the user can re-open; a colour scheme is saved at the end of
+     * the gradient editor, and both callers then switch the selection to that
+     * name — which would quietly show the built-in instead, with the authored
+     * gradient nowhere in the picker and no way to reach it. Same precedence,
+     * reported instead of swallowed, so the user renames and keeps their work.
      */
     saveCustom(name: string, data: ArrayLike<number>): ColorScheme {
         const trimmed = name.trim();
         if (!trimmed) throw new Error('Cannot save a colour scheme with an empty name.');
+        if (this.builtinIndex.has(trimmed)) {
+            throw new Error(
+                `"${trimmed}" is a built-in colour scheme. Pick a different name — a custom ` +
+                    `scheme cannot replace a built-in one.`
+            );
+        }
 
         // Constructing it first means a wrong-sized buffer is rejected before
         // anything is written.
         const scheme = ColorScheme.fromBytes(trimmed, data);
+        const previous = this.custom.get(trimmed);
         this.custom.set(trimmed, scheme.toBytes());
-        this.persistCustom(`colour scheme "${trimmed}"`);
+        try {
+            this.persistCustom(`colour scheme "${trimmed}"`);
+        } catch (err) {
+            // Without this the scheme survives in memory and shows up in the
+            // picker, then vanishes on reload — the worst of both outcomes for
+            // a user who has just been told the save failed.
+            if (previous) this.custom.set(trimmed, previous);
+            else this.custom.delete(trimmed);
+            throw err;
+        }
         return scheme;
     }
 
     deleteCustom(name: string): void {
-        if (!this.custom.delete(name)) return;
-        this.persistCustom('colour schemes');
+        const previous = this.custom.get(name);
+        if (previous === undefined) return;
+        this.custom.delete(name);
+        try {
+            this.persistCustom('colour schemes');
+        } catch (err) {
+            // A delete only shrinks the document, so this is not the quota —
+            // it is storage being unavailable. Put it back either way, so the
+            // catalogue keeps matching what a reload would produce.
+            this.custom.set(name, previous);
+            throw err;
+        }
     }
 
     private persistCustom(what: string): void {

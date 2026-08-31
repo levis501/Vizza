@@ -58,6 +58,14 @@ import {
     vectorsQuadIndices,
     VECTORS_MAX_LINES,
 } from '$lib/engine/sims/vectors/settings';
+import {
+    GradientSimulation,
+    defaultGradientLut,
+    parseGradientDisplayMode,
+    BAYER_PERIOD_PX,
+    GRADIENT_DISPLAY_MODE,
+    GRADIENT_QUANTIZATION_STEP,
+} from '$lib/engine/sims/gradient';
 import { Camera } from '$lib/engine/core/Camera';
 import { calculateTileCount, TEXTURE_FILTERING } from '$lib/engine/render/InfiniteRenderer';
 import { ResourceLedger, instrumentDevice } from '$lib/engine/core/resourceLedger';
@@ -2108,10 +2116,7 @@ test('Cylinders is static in time and varies in space', async () => {
         'Cylinders must ignore z — a radius mixing the clock in collapses the ' +
             'whole field to one value that sweeps round together'
     );
-    assert(
-        Math.max(...t0) - Math.min(...t0) > 1e-6,
-        'Cylinders must still vary across x and y'
-    );
+    assert(Math.max(...t0) - Math.min(...t0) > 1e-6, 'Cylinders must still vary across x and y');
 });
 
 /**
@@ -2693,6 +2698,425 @@ test('vectors create/destroy x20 leaves the resource ledger clean', async () => 
     const probe = createStorageBuffer(gpu.device, 256, { label: 'post-vectors probe' });
     const error = await gpu.device.popErrorScope();
     assert(error === null, `device unhealthy after 20 vectors cycles: ${error?.message}`);
+    probe.destroy();
+    churnTarget.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// Gradient — M6
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything here renders at exactly `BAYER_PERIOD_PX`.
+ *
+ * `bayer_dither` (gradient.wgsl:163) indexes its 16×16 matrix off the
+ * interpolated `uv` rather than off `@builtin(position)`, so the threshold
+ * lattice is a fraction of the target rather than a fixed pixel grid. At 256 px
+ * every one of the 256 thresholds is visited exactly once per 256×256 block,
+ * which is the shader at its intended resolution; at the 48–64 px the other
+ * sims test at, only the sixteen *lowest* thresholds (0..15 of 255) are ever
+ * sampled and the dither collapses into a hard edge that would pass a
+ * carelessly-written test while showing almost nothing.
+ */
+const GRADIENT_SIZE = BAYER_PERIOD_PX;
+
+/** Mean of one channel down each column — i.e. the horizontal ramp itself. */
+function columnMeans(pixels: Uint8Array, size: number, offset: number): Float64Array {
+    const means = new Float64Array(size);
+    for (let x = 0; x < size; x++) {
+        let total = 0;
+        for (let y = 0; y < size; y++) total += pixels[(y * size + x) * 4 + offset];
+        means[x] = total / size;
+    }
+    return means;
+}
+
+/**
+ * Columns whose channel value is not constant top to bottom.
+ *
+ * `fs_main` derives its colour from `uv.x` alone *except* through the dither,
+ * which is the only term that reads `uv.y`. So this count is a direct measure
+ * of whether the dither ran: it is 0 for smooth mode and for a dither that has
+ * silently become a plain quantiser, and large otherwise.
+ */
+function verticallyVaryingColumns(pixels: Uint8Array, size: number, offset: number): number[] {
+    const columns: number[] = [];
+    for (let x = 0; x < size; x++) {
+        let min = 255;
+        let max = 0;
+        for (let y = 0; y < size; y++) {
+            const v = pixels[(y * size + x) * 4 + offset];
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        // >1 rather than >0: unorm8 rounding, not the dither, is worth a step.
+        if (max - min > 1) columns.push(x);
+    }
+    return columns;
+}
+
+/** Render one frame of a gradient simulation into a fresh target and read it back. */
+async function renderGradient(sim: GradientSimulation): Promise<Uint8Array> {
+    const [target, view] = renderTarget(GRADIENT_SIZE, 'gradient target');
+    sim.renderFrame(view, 1 / 60);
+    const pixels = await readTexturePixels(gpu.device, target);
+    target.destroy();
+    return pixels;
+}
+
+test('gradient constructs and tears down with no validation error', async () => {
+    gpu.device.pushErrorScope('validation');
+
+    const sim = await GradientSimulation.create(gpu);
+    const [target, view] = renderTarget(48, 'gradient validation target');
+    sim.renderFrame(view, 1 / 60);
+    sim.renderFramePaused(view);
+    // resize is a no-op (simulation.rs:322) but the host calls it on every
+    // ResizeObserver tick, so it must at least not invalidate the pipeline.
+    sim.resize(96, 96);
+    sim.setDisplayMode(GRADIENT_DISPLAY_MODE.dithered);
+    sim.renderFrame(view, 1 / 60);
+    sim.destroy();
+    target.destroy();
+
+    const error = await gpu.device.popErrorScope();
+    assert(error === null, `gradient produced a validation error: ${error?.message}`);
+});
+
+test('gradient shows the default identity ramp before any LUT is pushed', async () => {
+    // The Rust seeds R=G=B=0..255 at construction (simulation.rs:142-153). In a
+    // browser a colour scheme arrives over a fetch, so without this seed the
+    // first frame would read an unwritten storage buffer — solid black, and
+    // indistinguishable from a broken pipeline.
+    const sim = await GradientSimulation.create(gpu);
+    const pixels = await renderGradient(sim);
+
+    assert(!hasNonFinite(pixels), 'the gradient produced non-finite pixels');
+    assert(!isUniform(pixels), 'the default ramp rendered flat — the LUT was never seeded');
+
+    const red = channelOffset(gpu.format, 'r');
+    const green = channelOffset(gpu.format, 'g');
+    const blue = channelOffset(gpu.format, 'b');
+
+    // A grey ramp: all three channels carry the same value at every pixel.
+    for (let i = 0; i < pixels.length; i += 4) {
+        assert(
+            Math.abs(pixels[i + red] - pixels[i + green]) <= 1 &&
+                Math.abs(pixels[i + red] - pixels[i + blue]) <= 1,
+            `the identity ramp is not grey at byte ${i}: ` +
+                `${pixels[i + red]}/${pixels[i + green]}/${pixels[i + blue]}`
+        );
+    }
+
+    // `sample_lut` maps uv.x through `clamp(index * 255, 0, 255)` with bilinear
+    // interpolation, so column x lands on (x + 0.5) * 255 / 256.
+    const means = columnMeans(pixels, GRADIENT_SIZE, red);
+    let error = 0;
+    for (let x = 0; x < GRADIENT_SIZE; x++) {
+        error += Math.abs(means[x] - ((x + 0.5) * 255) / 256);
+    }
+    error /= GRADIENT_SIZE;
+    assert(error <= 2, `identity ramp deviates from the LUT by ${error.toFixed(2)} levels`);
+
+    assert(means[0] <= 4, `the ramp starts at ${means[0].toFixed(1)}, not near black`);
+    assert(
+        means[GRADIENT_SIZE - 1] >= 250,
+        `the ramp ends at ${means[GRADIENT_SIZE - 1].toFixed(1)}, not near white`
+    );
+    for (let x = 1; x < GRADIENT_SIZE; x++) {
+        assert(
+            means[x] >= means[x - 1] - 1,
+            `the ramp is not monotonic at column ${x}: ${means[x - 1]} -> ${means[x]}`
+        );
+    }
+
+    sim.destroy();
+});
+
+test('gradient repaints when a LUT is pushed', async () => {
+    const sim = await GradientSimulation.create(gpu);
+    const before = await renderGradient(sim);
+
+    // Each channel gets a distinct shape, so the planar [R][G][B] layout is
+    // asserted as well as "something changed": a transposed LUT would show up
+    // as the wrong channel ramping.
+    const lut = new Uint32Array(768);
+    for (let i = 0; i < 256; i++) {
+        lut[i] = i; // red ramps up
+        lut[256 + i] = 255 - i; // green ramps down
+        lut[512 + i] = 128; // blue constant
+    }
+    sim.updateColorScheme(lut, false);
+
+    const after = await renderGradient(sim);
+    assert(!hasNonFinite(after), 'the pushed LUT produced non-finite pixels');
+    assert(
+        meanAbsoluteError(before, after) > 20,
+        'pushing a LUT did not change the image — update_gradient_preview reaches nothing'
+    );
+
+    const red = columnMeans(after, GRADIENT_SIZE, channelOffset(gpu.format, 'r'));
+    const green = columnMeans(after, GRADIENT_SIZE, channelOffset(gpu.format, 'g'));
+    const blueStats = channelStats(after, channelOffset(gpu.format, 'b'));
+
+    assert(
+        red[GRADIENT_SIZE - 1] - red[0] > 200,
+        `red should ramp up across the quad, got ${red[0].toFixed(1)} -> ${red[GRADIENT_SIZE - 1].toFixed(1)}`
+    );
+    assert(
+        green[0] - green[GRADIENT_SIZE - 1] > 200,
+        `green should ramp down across the quad, got ${green[0].toFixed(1)} -> ${green[GRADIENT_SIZE - 1].toFixed(1)}`
+    );
+    assertClose(blueStats.mean, 128, 2, 'the constant blue plane');
+    assert(
+        blueStats.max - blueStats.min <= 2,
+        `blue was declared constant but spans ${blueStats.min}..${blueStats.max}`
+    );
+
+    // A LUT of the wrong length is a caller bug that would otherwise write a
+    // short buffer and leave the tail of the previous scheme showing.
+    let threw = false;
+    try {
+        sim.updateColorScheme(new Uint32Array(256), false);
+    } catch {
+        threw = true;
+    }
+    assert(threw, 'a 256-entry LUT must be rejected, not written');
+
+    sim.destroy();
+});
+
+test('gradient display modes produce distinct images', async () => {
+    const sim = await GradientSimulation.create(gpu);
+
+    sim.setDisplayMode(GRADIENT_DISPLAY_MODE.smooth);
+    const smooth = await renderGradient(sim);
+    assert(sim.getState().display_mode === 0, 'state must report the mode that was set');
+
+    sim.setDisplayMode(GRADIENT_DISPLAY_MODE.dithered);
+    const dithered = await renderGradient(sim);
+    assert(sim.getState().display_mode === 1, 'state must report the mode that was set');
+
+    assert(
+        meanAbsoluteError(smooth, dithered) > 3,
+        'smooth and dithered rendered the same image — params never reached the shader'
+    );
+
+    // `quantize_color` (gradient.wgsl:192) rounds to 16 levels, and the dither
+    // only ever adds one whole step, so every byte must sit on the lattice.
+    const step = GRADIENT_QUANTIZATION_STEP;
+    const red = channelOffset(gpu.format, 'r');
+    let offLattice = 0;
+    let samples = 0;
+    for (let i = red; i < dithered.length; i += 4) {
+        samples++;
+        if (Math.abs(dithered[i] - Math.round(dithered[i] / step) * step) > 1) offLattice++;
+    }
+    assert(
+        offLattice / samples < 0.02,
+        `${((offLattice / samples) * 100).toFixed(1)}% of dithered pixels are off the ` +
+            `16-level lattice — the quantiser did not run`
+    );
+
+    // The unknown-mode arm (gradient.wgsl:228) falls back to smooth, and the
+    // parser clamps to it so get_current_state never reports a mode the shader
+    // will not take.
+    assert(parseGradientDisplayMode(7) === GRADIENT_DISPLAY_MODE.smooth, 'unknown -> smooth');
+    assert(parseGradientDisplayMode('1') === GRADIENT_DISPLAY_MODE.dithered, '"1" -> dithered');
+    sim.updateState('display_mode', 9);
+    assert(sim.getState().display_mode === 0, 'an out-of-range mode must clamp to smooth');
+    sim.updateState('displayMode', 1);
+    assert(sim.getState().display_mode === 1, 'the Rust spelling must work too');
+
+    sim.destroy();
+});
+
+test('the Bayer dither breaks the bands it is there to break', async () => {
+    // A dither that silently becomes a no-op looks fine in a screenshot — the
+    // image is still a gradient, just a banded one — so it is measured rather
+    // than eyeballed. Here: the dithered image must vary along y, since the
+    // threshold is the only term in fs_main that reads uv.y at all, and the
+    // smooth image must not. The sibling test below then checks that the
+    // variation averages back to the right colour rather than merely existing.
+    const sim = await GradientSimulation.create(gpu);
+    const red = channelOffset(gpu.format, 'r');
+
+    sim.setDisplayMode(GRADIENT_DISPLAY_MODE.smooth);
+    const smooth = await renderGradient(sim);
+    const smoothVarying = verticallyVaryingColumns(smooth, GRADIENT_SIZE, red);
+    assert(
+        smoothVarying.length === 0,
+        `smooth mode varies down ${smoothVarying.length} columns — fs_main should ` +
+            `depend on uv.x alone when the dither is off`
+    );
+
+    sim.setDisplayMode(GRADIENT_DISPLAY_MODE.dithered);
+    const dithered = await renderGradient(sim);
+    const varying = verticallyVaryingColumns(dithered, GRADIENT_SIZE, red);
+    assert(
+        varying.length >= 60,
+        `only ${varying.length} of ${GRADIENT_SIZE} columns dither — a plain quantiser ` +
+            `would give 0, so the Bayer threshold is barely reaching the comparison`
+    );
+
+    // Adjacent pixels must actually alternate, not merely differ somewhere down
+    // the column: the point of an ordered dither is the high-frequency mix.
+    let alternating = 0;
+    for (const x of varying) {
+        for (let y = 1; y < GRADIENT_SIZE; y++) {
+            const a = dithered[((y - 1) * GRADIENT_SIZE + x) * 4 + red];
+            const b = dithered[(y * GRADIENT_SIZE + x) * 4 + red];
+            if (Math.abs(a - b) >= GRADIENT_QUANTIZATION_STEP - 1) alternating++;
+        }
+    }
+    assert(
+        alternating > varying.length * 4,
+        `only ${alternating} adjacent-pixel level swaps across ${varying.length} dithering ` +
+            `columns — the threshold pattern is not spatially varied`
+    );
+
+    /*
+     * Pins a defect in the shader, reproduced rather than fixed.
+     *
+     * `apply_display_mode` (gradient.wgsl:216-224) quantises with `round` and
+     * then tests `color > quantized + threshold * step`. For any colour *below*
+     * its nearest level that test is false at every threshold, so the upper
+     * half of every band is snapped hard and never dithers; only the lower half
+     * mixes, and it can only ever reach a 50% mix. An ordered dither wants
+     * `floor(color / step + threshold) * step`, which dithers the whole band.
+     *
+     * Consequence: every band is half dithered and half hard-edged, so banding
+     * survives at each band's midpoint — exactly what the pass exists to
+     * remove. Not fixed here because the shader is shared with the desktop
+     * build and the change alters the dithered preview at every colour: an M14
+     * visual-parity decision, in the same class as M3's `advect_strength`
+     * blend. Asserted as-is so that when someone does change it, this says so.
+     */
+    const step = GRADIENT_QUANTIZATION_STEP;
+    const smoothMeans = columnMeans(smooth, GRADIENT_SIZE, red);
+    let aboveNearestLevel = 0;
+    let belowNearestLevel = 0;
+    for (const x of varying) {
+        const c = smoothMeans[x];
+        const level = Math.round(c / step) * step;
+        if (c > level + 1) aboveNearestLevel++;
+        else if (c < level - 1) belowNearestLevel++;
+    }
+    assert(
+        aboveNearestLevel > 40,
+        `only ${aboveNearestLevel} dithering columns sit above their nearest level`
+    );
+    assert(
+        belowNearestLevel === 0,
+        `${belowNearestLevel} columns below their nearest level now dither — the ` +
+            `round-instead-of-floor defect at gradient.wgsl:216 has been fixed; ` +
+            `record it in WEB_PORT.md and update this assertion`
+    );
+
+    sim.destroy();
+});
+
+test('the dither averages back to the colour quantisation would have lost', async () => {
+    /*
+     * The measurement above says the dither *moves* pixels; this one says it
+     * moves them to the right place, which is the whole reason banding is worth
+     * trading for noise.
+     *
+     * It uses a flat LUT rather than the ramp deliberately. Averaged down a
+     * single column the ramp gives a misleading answer: the 16 thresholds a
+     * column sees are one column of the Bayer matrix, and those are strongly
+     * clustered ({0,3,12,15,48,51,60,63,192,…} for x=0) even though the matrix
+     * as a whole is equidistributed. A dither is only accurate over a 2D
+     * neighbourhood, so the whole image has to be one colour for the mean to
+     * mean anything.
+     */
+    const flat = 124;
+    const step = GRADIENT_QUANTIZATION_STEP;
+    const nearestLevel = Math.round(flat / step) * step; // 119
+    assert(
+        Math.abs(flat - nearestLevel) > 3,
+        'the probe colour must sit well away from a quantisation level'
+    );
+
+    const lut = new Uint32Array(768).fill(flat);
+    const sim = await GradientSimulation.create(gpu, lut);
+    const red = channelOffset(gpu.format, 'r');
+
+    sim.setDisplayMode(GRADIENT_DISPLAY_MODE.smooth);
+    const smooth = await renderGradient(sim);
+    assertClose(channelStats(smooth, red).mean, flat, 1, 'a flat LUT in smooth mode');
+
+    sim.setDisplayMode(GRADIENT_DISPLAY_MODE.dithered);
+    const dithered = await renderGradient(sim);
+    const stats = channelStats(dithered, red);
+
+    // Two levels and only two: the dither adds exactly one step, never more.
+    assertClose(stats.min, nearestLevel, 1, 'the lower dither level');
+    assertClose(stats.max, nearestLevel + step, 1, 'the upper dither level');
+
+    const ditherError = Math.abs(stats.mean - flat);
+    const quantiseError = Math.abs(nearestLevel - flat);
+    assert(
+        ditherError < quantiseError * 0.25,
+        `the dithered mean is off by ${ditherError.toFixed(2)} where plain quantisation ` +
+            `is off by ${quantiseError.toFixed(2)} — the dither is decorative`
+    );
+
+    // Every one of the 256 thresholds is visited once per 256x256 block, so the
+    // mix is not merely close on average but exactly the expected count.
+    const expectedFraction = Math.ceil((256 * (flat - nearestLevel)) / step) / 256;
+    let raised = 0;
+    let total = 0;
+    for (let i = red; i < dithered.length; i += 4) {
+        total++;
+        if (dithered[i] > nearestLevel + step / 2) raised++;
+    }
+    assertClose(raised / total, expectedFraction, 0.01, 'the fraction of raised pixels');
+
+    sim.destroy();
+});
+
+test('gradient create/destroy x20 leaves the resource ledger clean', async () => {
+    const ledger = new ResourceLedger();
+    const instrumented: GpuContext = { ...gpu, device: instrumentDevice(gpu.device, ledger) };
+
+    // Allocated on the *uninstrumented* device, so the test's own target does
+    // not show up in the ledger it is asserting on.
+    const churnTarget = gpu.device.createTexture({
+        label: 'gradient churn target',
+        size: { width: 32, height: 32 },
+        format: gpu.format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    const churnView = churnTarget.createView();
+    const lut = defaultGradientLut();
+
+    for (let i = 0; i < 20; i++) {
+        const sim = await GradientSimulation.create(instrumented);
+        sim.renderFrame(churnView, 1 / 60);
+        sim.updateColorScheme(lut, false);
+        sim.setDisplayMode(i % 2);
+        sim.renderFrame(churnView, 1 / 60);
+        sim.destroy();
+        // destroy() is contractually idempotent — the host calls it on both
+        // teardown paths — and must not double-count.
+        sim.destroy();
+    }
+
+    const stats = ledger.stats();
+    assert(
+        stats.created >= 20 * 4,
+        `expected four tracked buffers per simulation, saw ${stats.created} over 20`
+    );
+    assert(
+        stats.live === 0,
+        `${stats.live} GPU objects leaked over 20 cycles: ${JSON.stringify(stats.byLabel)}`
+    );
+
+    gpu.device.pushErrorScope('validation');
+    const probe = createStorageBuffer(gpu.device, 256, { label: 'post-gradient probe' });
+    const error = await gpu.device.popErrorScope();
+    assert(error === null, `device unhealthy after 20 gradient cycles: ${error?.message}`);
     probe.destroy();
     churnTarget.destroy();
 });

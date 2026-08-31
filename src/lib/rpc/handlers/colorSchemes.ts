@@ -11,10 +11,39 @@ import { getEngineContext, hasEngineContext } from '../context';
 import { colorSchemeManager } from '$lib/engine/color/ColorSchemeManager';
 import { ColorScheme } from '$lib/engine/color/ColorScheme';
 
-/** Push the active scheme at the running simulation, if there is one. */
+/**
+ * Push the active scheme at the running simulation, if there is one.
+ *
+ * "If there is one" needs both checks. `hasEngineContext()` only says a host
+ * exists; `SimulationHost.updateColorScheme` goes through `requireSimulation()`
+ * (SimulationHost.ts:401), which throws "No simulation is running" when nothing
+ * has been constructed yet. Two ordinary sequences hit that window: a mode's
+ * `onMount` racing `start_simulation`, and the gradient editor's debounced
+ * `update_gradient_preview` landing just after the user has navigated away and
+ * the simulation has been torn down. Both callers only `console.error` what
+ * they catch, so the throw became console noise and, in the editor's case, a
+ * preview that appeared to stop working.
+ */
 function applyToSimulation(scheme: ColorScheme, reversed: boolean): void {
     if (!hasEngineContext()) return;
-    getEngineContext().updateColorScheme(scheme.toU32Buffer(), reversed);
+    const engine = getEngineContext();
+    if (engine.currentSimulation() === null) return;
+    engine.updateColorScheme(scheme.toU32Buffer(), reversed);
+}
+
+/**
+ * The `color_scheme_data: Vec<u8>` argument, as `serde` would have taken it.
+ *
+ * Both gradient editors send `Array.from(lut)` — 768 plain numbers — so the
+ * only thing worth checking on this side is that the argument arrived at all.
+ * `ColorScheme.fromBytes(undefined)` throws "Invalid LUT data size … undefined
+ * bytes", which sends the reader looking at the LUT rather than at the call.
+ */
+function requireLutData(value: unknown, command: string): ArrayLike<number> {
+    if (value == null || typeof (value as ArrayLike<number>).length !== 'number') {
+        throw new Error(`${command} was called without color_scheme_data.`);
+    }
+    return value as ArrayLike<number>;
 }
 
 export function registerColorSchemeHandlers(): void {
@@ -37,11 +66,17 @@ export function registerColorSchemeHandlers(): void {
         return null;
     });
 
+    /**
+     * The load() is not optional: `saveCustom` refuses a built-in's name, and
+     * before the packed blob has arrived it does not know any built-in names.
+     * Returns the trimmed name the scheme was actually stored under, which is
+     * the name the caller must select by (the Rust returns a status string
+     * here, which no caller reads either).
+     */
     register('save_custom_color_scheme', async (args) => {
         await colorSchemeManager.load();
-        const data = args.color_scheme_data as ArrayLike<number>;
-        colorSchemeManager.saveCustom(String(args.name), data);
-        return null;
+        const data = requireLutData(args.color_scheme_data, 'save_custom_color_scheme');
+        return colorSchemeManager.saveCustom(String(args.name), data).name;
     });
 
     /**
@@ -49,7 +84,7 @@ export function registerColorSchemeHandlers(): void {
      * simulation without touching the manager's persisted state.
      */
     register('update_gradient_preview', async (args) => {
-        const data = args.color_scheme_data as ArrayLike<number>;
+        const data = requireLutData(args.color_scheme_data, 'update_gradient_preview');
         const scheme = ColorScheme.fromBytes('preview', data);
         applyToSimulation(scheme, false);
         return null;

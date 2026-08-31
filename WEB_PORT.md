@@ -486,10 +486,29 @@ Smallest sim in the repo: 1 shader, 316 lines, one already-legal write-only stor
 **For M12 (Flow):** `flow/shaders/flow_vector_compute.wgsl:58-389` contains a much weaker duplicate of all eleven noise types — its "simplex" is value noise returning [0,1], so the `abs()` folding in its Billow branch is a no-op; its per-type lacunarity and persistence are invented; and it casts negative floats to `u32`, which is undefined. Delete that block and concatenate `noise.wgsl` instead.
 
 ### M6 — Gradient Editor
-- [ ] Port `gradient/shaders/gradient.wgsl` (326: sRGB↔linear↔XYZ↔Lab↔OKLab, Bayer dithering)
-- [ ] Custom LUT save/load in `localStorage` — **de-risks `save_custom_color_scheme`, which `ColorSchemeSelector` calls from all 9 modes**
-- [ ] **Test (L1/L4):** colour-space round-trip; custom LUT survives reload; picker lists all 167
-- [ ] **Visible:** working gradient editor
+- [x] Port `gradient/shaders/gradient.wgsl` (326) as `engine/sims/gradient/`, following the `mainMenu` precedent — both are render-only shader backgrounds over a LUT with nothing to advance. Two display modes: `0` smooth, `1` quantise-to-16-levels-then-Bayer
+- [x] **~180 of the shader's 326 lines are dead** — every sRGB↔linear↔XYZ↔Lab↔OKLab function and all three `interpolate_*` entry points are unreachable; `fs_main` calls `sample_lut` and `apply_display_mode` and nothing else. **The shader is not the reference implementation of anything the app runs**: interpolation is CPU-side and the GPU only ever samples a finished LUT
+- [x] Colour-space maths extracted into `engine/color/spaces.ts` — the port of `gradient.wgsl`, kept separate from `ColorScheme.ts` (the port of `shared/color_scheme.rs`, a 768-byte container). Canonical space set is `rgb | lab | oklab | oklch`
+- [x] **`culori` removed** — it was the app's only colour-conversion dependency and both importers now use `spaces.ts`. Production bundle 396 kB → **355 kB**
+- [x] Custom LUT save/load in `localStorage` — `saveCustom` refuses a built-in's name with a reported error rather than silently skipping (unlike `PresetStore`, because both callers immediately switch the selection to the saved name, so a silent skip would show the built-in with the authored gradient nowhere in the picker). Listing deduped; writes roll back the in-memory map when the quota throws
+- [x] **Test (L1):** 72 tests in `colorSpaces.test.ts` + 9 added to `colorScheme.test.ts`. **Anchored against published reference values, not just round trips** — Lindbloom's D65 Lab and Ottosson's OKLab primaries, each cited in a comment, because two mutually-inverse functions that are both wrong pass a round-trip test. Note culori's `lab` is **D50**: same nominal space, different numbers
+- [x] **Test (L3):** 7 tests including the default identity ramp, the planar `[R][G][B]` layout, and two dither tests
+- [x] **Test (L4):** 25 tests, parameterised over `GRADIENT_COLOR_SPACES` so a future space is covered automatically
+- [ ] **Visible:** working gradient editor — **needs confirming at :9994 in a real browser**; see M3's environment limitation
+
+**Defects found and fixed during M6:**
+1. **Two of five colour spaces threw, in all nine modes.** `ColorSchemeSelector` offered `Jzazbz` and `HSLuv` and mapped them to culori mode names culori does not register (it ships `jab` and `lchuv`). Selecting either threw `TypeError: converters[color.mode].rgb is not a function`, swallowed by a `console.error`, so the gradient silently stopped updating. `GradientEditorMode` offered the working names — the two copies had drifted, just not in the maths. Both now derive from one shared list.
+2. **The two editors baked different bytes from the same stops.** `GradientEditorMode.getColorAtPosition` clamps to [0,1] and holds the terminal colour; `ColorSchemeSelector`'s neither clamped nor held, and **extrapolated with `t` outside [0,1]** whenever no stop pair bracketed the position — reachable by dragging a handle inward. Both now use `sampleGradient`.
+3. **Both divided by zero on coincident stops**, reachable by dragging one handle onto another: `t = NaN`, and a poisoned LUT.
+4. **Both `.lut` export buttons wrote a file neither build can read.** They built an *interleaved* `r,g,b,…` list and wrote it as newline-separated **text**; the format is 768-byte **binary planar**. Now `buildGradientLut`.
+5. **`GradientEditorMode` had no loading gate at all** — `loading` was `const false`. Built properly, cleared in a `finally` so the no-WebGPU path is not bricked behind the overlay.
+6. **Two teardown hazards**: `updateGradient()` is debounced 50 ms, so navigating away right after an edit fired `update_gradient_preview` *after* teardown; and `applyToSimulation` guarded on `hasEngineContext()` but not on a simulation running, so `requireSimulation()` threw. Each fix independently suppresses the symptom, so the E2E spec pins the pair.
+7. **The preset selector offered `'Warm'` while `applyPreset` only matched `'Heat'`** — that option did nothing.
+8. `oklab_to_xyz` (`gradient.wgsl:123`) is not the inverse of its own `xyz_to_oklab` (row 1 is CSS Color 4's LMS→XYZ, rows 2-3 invert Ottosson's M₁), and `xyz_to_lab` uses the rounded 1976 constants. Both in dead code, so nothing on screen changes; `spaces.ts` uses Ottosson's pre-composed matrix, which is the only one reproducing the published primaries exactly.
+
+**Known defect left alone, deliberately:** **the dither never fires on the upper half of any band.** `apply_display_mode` quantises with `round` and then tests `color > quantized + threshold*step`; for a colour *below* its nearest level that is false at every threshold, so it snaps hard, and the lower half can only reach a 50% mix. Banding therefore survives at each band's midpoint — exactly what the pass exists to remove. An ordered dither wants `floor(color/step + threshold)*step`. The shader is shared with the desktop build and the fix changes the dithered preview at every colour, so this is an M14 visual-parity call, in the same class as M3's `advect_strength` blend. Asserted as-is.
+
+**Testing note for whoever touches the dither:** the Bayer matrix is indexed from `uv`, not `@builtin(position)`, so it repeats 16× across the target and only a **256-pixel multiple visits all 256 thresholds**. Below that the sampled sub-lattice is biased low and the dither collapses to a hard edge that a smaller test would pass happily. All gradient render tests run at 256² for this reason (`BAYER_PERIOD_PX`). A single Bayer *column* is clustered rather than equidistributed, so accuracy must be measured over a 2D neighbourhood, not per-column.
 
 ### M7 — Slime Mold
 - [ ] Port `compute.wgsl` (610, 5 entry points), `display.wgsl`, `gradient.wgsl`, `quad.wgsl`, `background_render.wgsl`
