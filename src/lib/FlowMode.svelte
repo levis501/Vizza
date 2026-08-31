@@ -488,8 +488,8 @@
 
 <script lang="ts">
     import { createEventDispatcher, onMount, onDestroy } from 'svelte';
-    import { invoke } from '@tauri-apps/api/core';
-    import { listen } from '@tauri-apps/api/event';
+    import { invoke } from '$lib/rpc';
+    import { listen } from '$lib/rpc';
     import Button from './components/shared/Button.svelte';
     import NumberDragBox from './components/inputs/NumberDragBox.svelte';
     import Selector from './components/inputs/Selector.svelte';

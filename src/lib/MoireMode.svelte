@@ -80,36 +80,30 @@
                         <select
                             id="moire-interference-mode"
                             value={settings.image_interference_mode as string}
-                            on:change={async (e) => {
-                                try {
-                                    const value = (e.target as HTMLSelectElement).value;
-                                    await invoke('update_simulation_setting', {
-                                        settingName: 'image_interference_mode',
-                                        value: value,
-                                    });
-                                } catch (err) {
-                                    console.error('Failed to update interference mode:', err);
-                                }
+                            on:change={(e) => {
+                                const value = (e.target as HTMLSelectElement).value;
+                                setSetting('image_interference_mode', value);
                             }}
                         >
+                            <!--
+                                The six variants of ImageInterferenceMode
+                                (moire/settings.rs:49). This list previously
+                                offered "Blend", which is not one of them and
+                                which the backend rejects.
+                            -->
+                            <option value="Replace">Replace</option>
+                            <option value="Add">Add</option>
+                            <option value="Multiply">Multiply</option>
+                            <option value="Overlay">Overlay</option>
+                            <option value="Mask">Mask</option>
                             <option value="Modulate">Modulate</option>
-                            <option value="Blend">Blend</option>
                         </select>
                     </div>
                     <div class="control-group">
                         <ImageSelector
                             fitMode={settings.image_fit_mode}
                             loadCommand="load_moire_image"
-                            onFitModeChange={async (value) => {
-                                try {
-                                    await invoke('update_simulation_setting', {
-                                        settingName: 'image_fit_mode',
-                                        value: value,
-                                    });
-                                } catch (err) {
-                                    console.error('Failed to update fit mode:', err);
-                                }
-                            }}
+                            onFitModeChange={(value) => setSetting('image_fit_mode', value)}
                         />
                     </div>
                     <div class="control-group">
@@ -117,20 +111,11 @@
                             <input
                                 type="checkbox"
                                 checked={settings.image_mirror_horizontal}
-                                on:change={async (e) => {
-                                    try {
-                                        const checked = (e.target as HTMLInputElement).checked;
-                                        await invoke('update_simulation_setting', {
-                                            settingName: 'image_mirror_horizontal',
-                                            value: checked,
-                                        });
-                                    } catch (err) {
-                                        console.error(
-                                            'Failed to update image mirror horizontal:',
-                                            err
-                                        );
-                                    }
-                                }}
+                                on:change={(e) =>
+                                    setSetting(
+                                        'image_mirror_horizontal',
+                                        (e.target as HTMLInputElement).checked
+                                    )}
                             />
                             Mirror horizontal
                         </label>
@@ -140,20 +125,11 @@
                             <input
                                 type="checkbox"
                                 checked={settings.image_mirror_vertical}
-                                on:change={async (e) => {
-                                    try {
-                                        const checked = (e.target as HTMLInputElement).checked;
-                                        await invoke('update_simulation_setting', {
-                                            settingName: 'image_mirror_vertical',
-                                            value: checked,
-                                        });
-                                    } catch (err) {
-                                        console.error(
-                                            'Failed to update image mirror vertical:',
-                                            err
-                                        );
-                                    }
-                                }}
+                                on:change={(e) =>
+                                    setSetting(
+                                        'image_mirror_vertical',
+                                        (e.target as HTMLInputElement).checked
+                                    )}
                             />
                             Mirror vertical
                         </label>
@@ -163,17 +139,11 @@
                             <input
                                 type="checkbox"
                                 checked={settings.image_invert_tone}
-                                on:change={async (e) => {
-                                    try {
-                                        const checked = (e.target as HTMLInputElement).checked;
-                                        await invoke('update_simulation_setting', {
-                                            settingName: 'image_invert_tone',
-                                            value: checked,
-                                        });
-                                    } catch (err) {
-                                        console.error('Failed to update image invert tone:', err);
-                                    }
-                                }}
+                                on:change={(e) =>
+                                    setSetting(
+                                        'image_invert_tone',
+                                        (e.target as HTMLInputElement).checked
+                                    )}
                             />
                             Invert tone
                         </label>
@@ -192,7 +162,7 @@
             <!-- Controls -->
             <ControlsPanel
                 mouseInteractionText="🖱️ Mouse wheel: Zoom | Drag: Pan camera"
-                on:navigate={(e) => dispatch('navigate', { detail: e.detail })}
+                on:navigate={(e) => dispatch('navigate', e.detail)}
             />
 
             <!-- Actions -->
@@ -212,7 +182,8 @@
                     <label class="setting-label" for="moire-speed">Speed:</label>
                     <NumberDragBox
                         id="moire-speed"
-                        bind:value={settings.speed}
+                        value={settings.speed}
+                        on:change={({ detail }) => setSetting('speed', detail)}
                         min={0.0}
                         max={5.0}
                         step={0.01}
@@ -228,20 +199,18 @@
                     <select
                         id="moire-generator-type"
                         value={settings.generator_type as string}
-                        on:change={async (e) => {
-                            try {
-                                const value = (e.target as HTMLSelectElement).value;
-                                await invoke('update_simulation_setting', {
-                                    settingName: 'generator_type',
-                                    value: value,
-                                });
-                            } catch (err) {
-                                console.error('Failed to update generator type:', err);
-                            }
+                        on:change={(e) => {
+                            const value = (e.target as HTMLSelectElement).value;
+                            setSetting('generator_type', value);
                         }}
                     >
-                        <option value="linear">Linear</option>
-                        <option value="radial">Radial</option>
+                        <!--
+                            MoireGeneratorType serializes capitalised, so
+                            lowercase option values left the select showing
+                            nothing selected and the Radial panel unreachable.
+                        -->
+                        <option value="Linear">Linear</option>
+                        <option value="Radial">Radial</option>
                     </select>
                 </div>
                 <div class="settings-grid">
@@ -250,7 +219,7 @@
                         <NumberDragBox
                             id="moire-base-freq"
                             value={settings.base_freq as number}
-                            on:change={({ detail }) => (settings!.base_freq = detail)}
+                            on:change={({ detail }) => setSetting('base_freq', detail)}
                             min={0.1}
                             max={20.0}
                             step={0.1}
@@ -261,7 +230,7 @@
                         <NumberDragBox
                             id="moire-amount"
                             value={settings.moire_amount as number}
-                            on:change={({ detail }) => (settings!.moire_amount = detail)}
+                            on:change={({ detail }) => setSetting('moire_amount', detail)}
                             min={0.0}
                             max={1.0}
                             step={0.01}
@@ -284,7 +253,7 @@
                         <NumberDragBox
                             id="moire-scale"
                             value={settings.moire_scale as number}
-                            on:change={({ detail }) => (settings!.moire_scale = detail)}
+                            on:change={({ detail }) => setSetting('moire_scale', detail)}
                             min={0.1}
                             max={10.0}
                             step={0.1}
@@ -295,7 +264,7 @@
                         <NumberDragBox
                             id="moire-interference"
                             value={settings.moire_interference as number}
-                            on:change={({ detail }) => (settings!.moire_interference = detail)}
+                            on:change={({ detail }) => setSetting('moire_interference', detail)}
                             min={0.0}
                             max={1.0}
                             step={0.01}
@@ -305,7 +274,7 @@
             </fieldset>
 
             <!-- Radial Pattern Settings (shown when Radial is selected) -->
-            {#if settings.generator_type === 'radial'}
+            {#if settings.generator_type === 'Radial'}
                 <fieldset>
                     <legend>Radial Pattern Settings</legend>
                     <div class="settings-grid">
@@ -317,7 +286,7 @@
                                 id="moire-swirl-strength"
                                 value={settings.radial_swirl_strength as number}
                                 on:change={({ detail }) =>
-                                    (settings!.radial_swirl_strength = detail)}
+                                    setSetting('radial_swirl_strength', detail)}
                                 min={0.0}
                                 max={5.0}
                                 step={0.01}
@@ -331,7 +300,7 @@
                                 id="moire-starburst-count"
                                 value={settings.radial_starburst_count as number}
                                 on:change={({ detail }) =>
-                                    (settings!.radial_starburst_count = detail)}
+                                    setSetting('radial_starburst_count', detail)}
                                 min={0}
                                 max={128}
                                 step={1}
@@ -345,7 +314,7 @@
                                 id="moire-center-brightness"
                                 value={settings.radial_center_brightness as number}
                                 on:change={({ detail }) =>
-                                    (settings!.radial_center_brightness = detail)}
+                                    setSetting('radial_center_brightness', detail)}
                                 min={0.0}
                                 max={2.0}
                                 step={0.01}
@@ -365,7 +334,7 @@
                         <NumberDragBox
                             id="moire-flow-strength"
                             value={settings.advect_strength as number}
-                            on:change={({ detail }) => (settings!.advect_strength = detail)}
+                            on:change={({ detail }) => setSetting('advect_strength', detail)}
                             min={0.0}
                             max={5.0}
                             step={0.01}
@@ -376,7 +345,7 @@
                         <NumberDragBox
                             id="moire-flow-speed"
                             value={settings.advect_speed as number}
-                            on:change={({ detail }) => (settings!.advect_speed = detail)}
+                            on:change={({ detail }) => setSetting('advect_speed', detail)}
                             min={0.0}
                             max={10.0}
                             step={0.01}
@@ -387,7 +356,7 @@
                         <NumberDragBox
                             id="moire-curl"
                             value={settings.curl as number}
-                            on:change={({ detail }) => (settings!.curl = detail)}
+                            on:change={({ detail }) => setSetting('curl', detail)}
                             min={0.0}
                             max={1.0}
                             step={0.01}
@@ -398,7 +367,7 @@
                         <NumberDragBox
                             id="moire-decay"
                             value={settings.decay as number}
-                            on:change={({ detail }) => (settings!.decay = detail)}
+                            on:change={({ detail }) => setSetting('decay', detail)}
                             min={0.0}
                             max={1.0}
                             step={0.01}
@@ -415,7 +384,7 @@
 
 <script lang="ts">
     import { onMount, onDestroy } from 'svelte';
-    import { invoke } from '@tauri-apps/api/core';
+    import { invoke } from '$lib/rpc';
     import SimulationLayout from './components/shared/SimulationLayout.svelte';
     import CollapsibleFieldset from './components/shared/CollapsibleFieldset.svelte';
     import PresetFieldset from './components/shared/PresetFieldset.svelte';
@@ -608,6 +577,20 @@
         }
     }
 
+    /**
+     * Optimistic local update, then push it to the engine.
+     *
+     * Every drag box below used to do only the first half — `settings!.curl =
+     * detail` and nothing more — so twelve of the thirteen numeric controls
+     * moved a number on screen and changed nothing in the simulation. Only
+     * "Grid Rotation" was ever wired up.
+     */
+    function setSetting(settingName: string, value: number | string | boolean) {
+        if (!settings) return;
+        settings = { ...settings, [settingName]: value };
+        void updateSetting(settingName, value);
+    }
+
     // Update a specific setting
     async function updateSetting(settingName: string, value: string | number | boolean) {
         try {
@@ -772,10 +755,59 @@
     }
 
     // Mouse interaction
-    function handleMouseEvent() {
-        // Moiré simulation doesn't use mouse interaction, but handle auto-hide
-        if (autoHideManager) {
-            autoHideManager.handleUserInteraction();
+    //
+    // Upstream this was a no-op ("Moiré simulation doesn't use mouse
+    // interaction") even though the control panel advertises "Mouse wheel:
+    // Zoom | Drag: Pan camera". Moiré has no brush, so there is nothing to
+    // paint — but the camera is real and every other mode drives it, so the
+    // advertised controls are implemented here rather than the text removed.
+    let isMousePressed = false;
+    let lastPanX = 0;
+    let lastPanY = 0;
+
+    async function handleMouseEvent(e: CustomEvent) {
+        const event = e.detail as MouseEvent | WheelEvent;
+        if (autoHideManager) autoHideManager.handleUserInteraction();
+
+        if (event.type === 'wheel') {
+            const wheelEvent = event as WheelEvent;
+            wheelEvent.preventDefault();
+            // Physical pixels: the legacy convention every mode uses, undone
+            // again in rpc/handlers/camera.ts. See WEB_PORT.md.
+            const dpr = window.devicePixelRatio || 1;
+            try {
+                await invoke('zoom_camera_to_cursor', {
+                    delta: -wheelEvent.deltaY * 0.001,
+                    cursorX: wheelEvent.clientX * dpr,
+                    cursorY: wheelEvent.clientY * dpr,
+                });
+            } catch (err) {
+                console.error('Failed to zoom:', err);
+            }
+        } else if (event.type === 'mousedown') {
+            const mouseEvent = event as MouseEvent;
+            mouseEvent.preventDefault();
+            if (mouseEvent.button === 0 || mouseEvent.button === 1) {
+                isMousePressed = true;
+                lastPanX = mouseEvent.clientX;
+                lastPanY = mouseEvent.clientY;
+            }
+        } else if (event.type === 'mousemove' && isMousePressed) {
+            const mouseEvent = event as MouseEvent;
+            mouseEvent.preventDefault();
+            const dx = (mouseEvent.clientX - lastPanX) * 0.002;
+            const dy = (lastPanY - mouseEvent.clientY) * 0.002; // Y flipped
+            lastPanX = mouseEvent.clientX;
+            lastPanY = mouseEvent.clientY;
+            try {
+                await invoke('pan_camera', { deltaX: dx, deltaY: dy });
+            } catch (err) {
+                console.error('Failed to pan:', err);
+            }
+        } else if (event.type === 'mouseup') {
+            isMousePressed = false;
+        } else if (event.type === 'contextmenu') {
+            (event as MouseEvent).preventDefault();
         }
     }
 

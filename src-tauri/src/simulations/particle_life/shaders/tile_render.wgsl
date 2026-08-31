@@ -59,7 +59,9 @@ struct SpeciesColors {
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
-    @location(0) species: u32,
+    // Integral inter-stage values cannot be interpolated; WGSL requires the
+    // attribute explicitly and Chrome rejects the module without it.
+    @location(0) @interpolate(flat) species: u32,
     @location(1) velocity_magnitude: f32,
     @location(2) world_pos: vec2<f32>,
     @location(3) tile_fade_factor: f32,

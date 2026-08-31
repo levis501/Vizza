@@ -12,7 +12,10 @@
         "resolveJsonModule": true,
         "isolatedModules": true,
         "noEmit": true,
-        "types": ["vite/client", "svelte"],
+        "types": ["vite/client", "svelte", "@webgpu/types"],
+        "paths": {
+            "$lib/*": ["./src/lib/*"]
+        },
 
         /* Linting */
         "strict": true,

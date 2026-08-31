@@ -177,7 +177,7 @@
 
 <script lang="ts">
     import { createEventDispatcher } from 'svelte';
-    import { invoke } from '@tauri-apps/api/core';
+    import { invoke } from '$lib/rpc';
     import NumberDragBox from '../inputs/NumberDragBox.svelte';
 
     const dispatch = createEventDispatcher();

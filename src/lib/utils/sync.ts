@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '$lib/rpc';
 
 /**
  * Creates standardized sync functions for a simulation mode.

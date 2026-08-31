@@ -8,6 +8,14 @@
     </head>
 
     <body>
+        <!--
+            The WebGPU canvas is created once, here, behind the whole app — not
+            per mode. A GPUCanvasContext per mode transition is the top source of
+            flicker and context-lost bugs. pointer-events stay off it so input
+            keeps flowing to the DOM, which is what preserves each mode's
+            isDirectTarget() check.
+        -->
+        <canvas id="vizza-canvas"></canvas>
         <div id="app"></div>
     </body>
 </html>

@@ -51,7 +51,7 @@
 
 <script lang="ts">
     import { createEventDispatcher, onMount } from 'svelte';
-    import { invoke } from '@tauri-apps/api/core';
+    import { invoke } from '$lib/rpc';
     import Button from './Button.svelte';
     import NumberDragBox from '../inputs/NumberDragBox.svelte';
     import CollapsibleFieldset from './CollapsibleFieldset.svelte';

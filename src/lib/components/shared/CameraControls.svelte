@@ -2,7 +2,7 @@
 
 <script lang="ts">
     import { onMount, onDestroy } from 'svelte';
-    import { invoke } from '@tauri-apps/api/core';
+    import { invoke } from '$lib/rpc';
     import { createEventDispatcher } from 'svelte';
 
     const dispatch = createEventDispatcher();

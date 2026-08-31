@@ -270,7 +270,7 @@
 
 <script lang="ts">
     import { createEventDispatcher, tick } from 'svelte';
-    import { invoke } from '@tauri-apps/api/core';
+    import { invoke } from '$lib/rpc';
     import Selector from '../inputs/Selector.svelte';
     import { interpolate, formatHex } from 'culori';
 

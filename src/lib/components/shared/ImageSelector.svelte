@@ -21,12 +21,34 @@
 
 <script lang="ts">
     import { createEventDispatcher } from 'svelte';
-    import { invoke } from '@tauri-apps/api/core';
-    import { open } from '@tauri-apps/plugin-dialog';
+    import { invoke } from '$lib/rpc';
     import Selector from '../inputs/Selector.svelte';
     import Button from './Button.svelte';
 
     const dispatch = createEventDispatcher();
+
+    const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'tiff'];
+
+    /**
+     * Browser replacement for the native file dialog.
+     *
+     * The desktop app opened a Tauri dialog and handed Rust a filesystem path.
+     * There is no path in a browser, so we collect a File and pass it to the
+     * engine, which decodes it with createImageBitmap.
+     */
+    function pickImageFile(): Promise<File | null> {
+        return new Promise((resolve) => {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = IMAGE_EXTENSIONS.map((e) => `.${e}`).join(',');
+            input.addEventListener('change', () => resolve(input.files?.[0] ?? null), {
+                once: true,
+            });
+            // A cancelled picker fires no 'change' event in most browsers.
+            input.addEventListener('cancel', () => resolve(null), { once: true });
+            input.click();
+        });
+    }
 
     // Props
     export let fitMode: string = 'Stretch';
@@ -41,19 +63,11 @@
 
     async function handleLoadImage() {
         try {
-            const selected = await open({
-                multiple: false,
-                filters: [
-                    {
-                        name: 'Images',
-                        extensions: ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'tiff'],
-                    },
-                ],
-            });
+            const file = await pickImageFile();
 
-            if (selected && loadCommand) {
-                await invoke(loadCommand, { imagePath: selected });
-                dispatch('imageLoaded', { imagePath: selected });
+            if (file && loadCommand) {
+                await invoke(loadCommand, { imageFile: file, imagePath: file.name });
+                dispatch('imageLoaded', { imagePath: file.name, imageFile: file });
             }
         } catch (err) {
             console.error('Failed to load image:', err);

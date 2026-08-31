@@ -244,8 +244,8 @@
 
 <script lang="ts">
     import { createEventDispatcher, onMount, onDestroy } from 'svelte';
-    import { invoke } from '@tauri-apps/api/core';
-    import { listen } from '@tauri-apps/api/event';
+    import { invoke } from '$lib/rpc';
+    import { listen } from '$lib/rpc';
     import SimulationLayout from './components/shared/SimulationLayout.svelte';
     import CameraControls from './components/shared/CameraControls.svelte';
     import Selector from './components/inputs/Selector.svelte';

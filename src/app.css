@@ -1,4 +1,25 @@
 /* Basic app-wide styles */
+
+/*
+ * The Tauri build painted nothing: the native window was transparent and wgpu
+ * rendered behind the webview. In the browser the WebGPU canvas sits behind
+ * #app instead, so the root must supply an opaque backdrop — otherwise the
+ * page shows through white before the first frame.
+ *
+ * body and #app stay transparent so the canvas shows through; only the root
+ * element paints.
+ *
+ * This MUST be `:root`, not `html`. styles.css — which this app now imports
+ * for its design tokens, and which was written around a light default theme —
+ * sets `:root { background-color: #f6f6f6; color: #0f0f0f }`. A bare `html`
+ * selector loses to it on specificity no matter the import order, leaving the
+ * page near-white behind the menu's 80%-black scrim.
+ */
+:root {
+    background-color: #0a0a0a;
+    color: rgba(255, 255, 255, 0.9);
+}
+
 html,
 body {
     margin: 0;
@@ -12,9 +33,31 @@ body {
     -webkit-text-size-adjust: 100%;
 }
 
+/*
+ * The canvas fills the viewport behind #app. The Tauri build got this effect
+ * from a transparent native window with wgpu drawing behind the webview; the
+ * same transparency declarations on .simulation-container, body and #app now
+ * let the canvas show through instead, so no component markup changes.
+ *
+ * pointer-events: none is load-bearing, not cosmetic — every mode decides
+ * whether a click paints into the simulation by testing event.target, and a
+ * hit-testable canvas would break that.
+ */
+#vizza-canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    z-index: 0;
+    pointer-events: none;
+}
+
 #app {
     height: 100%;
     background-color: transparent;
+    position: relative;
+    z-index: 1;
 }
 
 @font-face {

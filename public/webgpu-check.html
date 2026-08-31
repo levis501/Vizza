@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Vizza — WebGPU check</title>
+        <style>
+            :root { color-scheme: dark; }
+            body {
+                margin: 0;
+                padding: 2rem;
+                background: #0a0a0a;
+                color: rgba(255, 255, 255, 0.9);
+                font: 15px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+            }
+            h1 { font-size: 1.3rem; margin: 0 0 1.5rem; font-weight: 600; }
+            #verdict {
+                padding: 1rem 1.25rem;
+                border-radius: 6px;
+                margin-bottom: 1.5rem;
+                border: 1px solid;
+                font-size: 1.05rem;
+            }
+            .ok   { background: rgba(16, 185, 129, 0.12); border-color: #10b981; color: #6ee7b7; }
+            .bad  { background: rgba(239, 68, 68, 0.12);  border-color: #ef4444; color: #fca5a5; }
+            .warn { background: rgba(245, 158, 11, 0.12); border-color: #f59e0b; color: #fcd34d; }
+            table { border-collapse: collapse; width: 100%; max-width: 46rem; }
+            td { padding: 0.3rem 0.9rem 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.08); vertical-align: top; }
+            td:first-child { color: rgba(255,255,255,0.55); white-space: nowrap; }
+            td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+            h2 { font-size: 0.95rem; margin: 2rem 0 0.5rem; color: rgba(255,255,255,0.5); font-weight: 600; }
+            #copy {
+                margin-top: 2rem; padding: 0.6rem 1.1rem; cursor: pointer;
+                background: #646cff; color: #fff; border: 0; border-radius: 4px;
+                font: inherit; font-size: 0.9rem;
+            }
+            #copy:hover { background: #535bf2; }
+            pre {
+                margin-top: 1rem; padding: 1rem; background: rgba(255,255,255,0.04);
+                border-radius: 4px; overflow-x: auto; font-size: 0.8rem;
+                color: rgba(255,255,255,0.6);
+            }
+        </style>
+    </head>
+    <body>
+        <h1>Vizza — WebGPU capability check</h1>
+        <div id="verdict">Checking…</div>
+        <div id="detail"></div>
+        <button id="copy" hidden>Copy report</button>
+        <pre id="report" hidden></pre>
+
+        <script type="module">
+            const verdict = document.getElementById('verdict');
+            const detail = document.getElementById('detail');
+            const reportEl = document.getElementById('report');
+            const copyBtn = document.getElementById('copy');
+
+            const MIB = 1024 * 1024;
+            const fmtBytes = (n) =>
+                n >= MIB ? `${(n / MIB).toFixed(0)} MiB` : `${n.toLocaleString()} B`;
+
+            /** The limits that actually gate this port's simulations. */
+            const KEY_LIMITS = [
+                ['maxStorageBufferBindingSize', 'caps every particle buffer', fmtBytes],
+                ['maxBufferSize', 'largest single allocation', fmtBytes],
+                ['maxComputeWorkgroupSizeX', 'agent kernels use 64', String],
+                ['maxComputeInvocationsPerWorkgroup', 'trail kernels use 16x16 = 256', String],
+                ['maxStorageBuffersPerShaderStage', 'Flow binds 6', String],
+                ['maxTextureDimension2D', 'trail maps want 2048', String],
+                ['maxComputeWorkgroupsPerDimension', 'Gray-Scott dispatches w/8', String],
+            ];
+
+            function table(rows) {
+                const t = document.createElement('table');
+                t.innerHTML = rows
+                    .map(([k, v]) => `<td>${k}</td><td>${v}</td>`)
+                    .map((r) => `<tr>${r}</tr>`)
+                    .join('');
+                return t;
+            }
+
+            function section(title, rows) {
+                const h = document.createElement('h2');
+                h.textContent = title;
+                detail.append(h, table(rows));
+            }
+
+            const report = {};
+
+            (async () => {
+                report.isSecureContext = window.isSecureContext;
+                report.origin = location.origin;
+
+                section('Context', [
+                    ['origin', location.origin],
+                    ['isSecureContext', String(window.isSecureContext)],
+                    ['navigator.gpu', String(!!navigator.gpu)],
+                    ['navigator.clipboard', String(!!navigator.clipboard)],
+                ]);
+
+                // WebGPU is a powerful API and is exposed only in secure
+                // contexts. http://localhost and http://127.0.0.1 qualify; a
+                // plain-http LAN hostname does not, and navigator.gpu is then
+                // simply absent — indistinguishable at a glance from "no
+                // WebGPU support".
+                if (!window.isSecureContext) {
+                    verdict.className = 'bad';
+                    verdict.innerHTML =
+                        '<strong>Not a secure context.</strong> WebGPU is unavailable at ' +
+                        `<code>${location.origin}</code> for that reason alone — this says ` +
+                        'nothing about whether your GPU or browser supports it. ' +
+                        'Reach the app over <code>localhost</code> (SSH tunnel), over HTTPS, ' +
+                        'or allowlist this origin in <code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>, ' +
+                        'then re-run this check.';
+                    report.webgpu = false;
+                    report.reason = 'insecure-context';
+                    finish();
+                    return;
+                }
+
+                if (!navigator.gpu) {
+                    verdict.className = 'bad';
+                    verdict.textContent =
+                        'Secure context, but navigator.gpu is missing — this browser genuinely has no WebGPU. Vizza Web needs Chrome/Edge 113+.';
+                    report.webgpu = false;
+                    report.reason = 'no-webgpu';
+                    finish();
+                    return;
+                }
+
+                let adapter;
+                try {
+                    adapter = await navigator.gpu.requestAdapter({
+                        powerPreference: 'high-performance',
+                    });
+                } catch (e) {
+                    /* fall through */
+                }
+
+                if (!adapter) {
+                    verdict.className = 'bad';
+                    verdict.textContent =
+                        'WebGPU exists but no GPU adapter was granted. Check chrome://gpu — hardware acceleration may be disabled.';
+                    report.webgpu = true;
+                    report.adapter = false;
+                    finish();
+                    return;
+                }
+
+                const info = adapter.info ?? {};
+                const isFallback = adapter.isFallbackAdapter === true;
+                const software = /swiftshader|lavapipe|llvmpipe|software|warp/i.test(
+                    `${info.description ?? ''} ${info.architecture ?? ''}`
+                );
+
+                let device = null;
+                let deviceErr = '';
+                try {
+                    device = await adapter.requestDevice();
+                } catch (e) {
+                    deviceErr = String(e);
+                }
+
+                if (!device) {
+                    verdict.className = 'bad';
+                    verdict.textContent = `Adapter found but requestDevice() failed: ${deviceErr}`;
+                } else if (software || isFallback) {
+                    verdict.className = 'warn';
+                    verdict.textContent =
+                        'WebGPU works, but on a SOFTWARE renderer. The simulations will run correctly and very slowly. Worth enabling GPU acceleration before judging performance.';
+                } else {
+                    verdict.className = 'ok';
+                    verdict.textContent =
+                        'WebGPU is available on hardware. This machine can run the port.';
+                }
+
+                report.webgpu = true;
+                report.adapter = true;
+                report.software = software || isFallback;
+                report.info = {
+                    vendor: info.vendor ?? '',
+                    architecture: info.architecture ?? '',
+                    device: info.device ?? '',
+                    description: info.description ?? '',
+                };
+
+                section('Adapter', [
+                    ['vendor', info.vendor || '(not reported)'],
+                    ['architecture', info.architecture || '(not reported)'],
+                    ['description', info.description || '(not reported)'],
+                    ['fallback adapter', String(isFallback)],
+                ]);
+
+                if (device) {
+                    const lim = device.limits;
+                    report.limits = {};
+                    section(
+                        'Limits that gate this port',
+                        KEY_LIMITS.map(([key, why, fmt]) => {
+                            const v = lim[key];
+                            report.limits[key] = v;
+                            return [`${key}<br><span style="opacity:.45">${why}</span>`, fmt(v)];
+                        })
+                    );
+
+                    // The single number that sets the Slime Mold ceiling: 16 B/agent.
+                    const agents = Math.floor(
+                        (lim.maxStorageBufferBindingSize * 0.9) / 16
+                    );
+                    report.slimeMoldAgentCeiling = agents;
+                    section('Derived caps', [
+                        [
+                            'Slime Mold agents<br><span style="opacity:.45">90% of the storage limit at 16 B each</span>',
+                            `${(agents / 1e6).toFixed(1)} M`,
+                        ],
+                    ]);
+
+                    report.features = [...device.features].sort();
+                    section('Features', [
+                        ['count', String(report.features.length)],
+                        ['timestamp-query', String(device.features.has('timestamp-query'))],
+                        ['float32-filterable', String(device.features.has('float32-filterable'))],
+                    ]);
+                }
+
+                finish();
+            })();
+
+            function finish() {
+                report.userAgent = navigator.userAgent;
+                reportEl.textContent = JSON.stringify(report, null, 2);
+                reportEl.hidden = false;
+                copyBtn.hidden = false;
+                copyBtn.addEventListener('click', async () => {
+                    // navigator.clipboard is itself secure-context-only, which
+                    // is exactly the case this page has to report on. Fall back
+                    // to selecting the text so the button always does something.
+                    try {
+                        if (!navigator.clipboard) throw new Error('no clipboard API');
+                        await navigator.clipboard.writeText(reportEl.textContent);
+                        copyBtn.textContent = 'Copied';
+                    } catch {
+                        const range = document.createRange();
+                        range.selectNodeContents(reportEl);
+                        const sel = getSelection();
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                        copyBtn.textContent = 'Selected — press Cmd+C';
+                    }
+                    setTimeout(() => (copyBtn.textContent = 'Copy report'), 2500);
+                });
+            }
+        </script>
+    </body>
+</html>

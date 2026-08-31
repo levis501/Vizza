@@ -86,7 +86,7 @@
 
 <script lang="ts">
     import { onMount } from 'svelte';
-    import { invoke } from '@tauri-apps/api/core';
+    import { invoke } from '$lib/rpc';
     import MainMenu from './lib/MainMenu.svelte';
     import SlimeMoldMode from './lib/SlimeMoldMode.svelte';
     import GrayScottMode from './lib/GrayScottMode.svelte';

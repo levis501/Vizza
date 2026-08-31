@@ -271,8 +271,8 @@
 
 <script lang="ts">
     import { onMount, onDestroy, createEventDispatcher } from 'svelte';
-    import { invoke } from '@tauri-apps/api/core';
-    import { listen } from '@tauri-apps/api/event';
+    import { invoke } from '$lib/rpc';
+    import { listen } from '$lib/rpc';
 
     import SimulationLayout from './components/shared/SimulationLayout.svelte';
     import CollapsibleFieldset from './components/shared/CollapsibleFieldset.svelte';

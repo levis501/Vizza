@@ -88,7 +88,9 @@ fn get_lut_color(intensity: f32) -> vec3<f32> {
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) particle_index: u32,
+    // Integral inter-stage values cannot be interpolated; WGSL requires the
+    // attribute explicitly and Chrome rejects the module without it.
+    @location(1) @interpolate(flat) particle_index: u32,
 }
 
 @vertex
@@ -142,7 +144,10 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) in
 }
 
 @fragment
-fn fs_main(@location(0) uv: vec2<f32>, @location(1) particle_index: u32) -> @location(0) vec4<f32> {
+fn fs_main(
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) particle_index: u32,
+) -> @location(0) vec4<f32> {
     let particle = particles[particle_index];
     
     // Check if particle is dead (age >= lifetime) - if so, discard it completely

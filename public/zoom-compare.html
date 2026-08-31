@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Vizza — zoom_to_cursor comparison</title>
+        <style>
+            :root { color-scheme: dark; }
+            body {
+                margin: 0; padding: 1.5rem 2rem 3rem;
+                background: #0a0a0a; color: rgba(255,255,255,0.9);
+                font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+            }
+            h1 { font-size: 1.2rem; margin: 0 0 0.3rem; }
+            .lede { color: rgba(255,255,255,0.55); max-width: 62rem; margin: 0 0 1.5rem; }
+            .panes { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+            .pane { flex: 1 1 380px; min-width: 340px; }
+            .pane h2 { font-size: 0.95rem; margin: 0 0 0.15rem; }
+            .pane .sub { color: rgba(255,255,255,0.45); font-size: 0.8rem; margin: 0 0 0.5rem; min-height: 2.6em; }
+            .bad h2 { color: #fca5a5; }
+            .good h2 { color: #6ee7b7; }
+            canvas {
+                display: block; width: 100%; aspect-ratio: 4 / 3;
+                border: 1px solid rgba(255,255,255,0.2); border-radius: 4px;
+                background: #111; cursor: crosshair; touch-action: none;
+            }
+            .readout {
+                margin-top: 0.5rem; font-size: 0.78rem; color: rgba(255,255,255,0.6);
+                font-variant-numeric: tabular-nums;
+            }
+            .readout .drift { color: #fca5a5; font-weight: 600; }
+            .readout .ok { color: #6ee7b7; font-weight: 600; }
+            .controls { margin: 1.5rem 0 0.5rem; display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+            button {
+                font: inherit; font-size: 0.85rem; padding: 0.45rem 0.9rem; cursor: pointer;
+                background: rgba(255,255,255,0.1); color: inherit;
+                border: 1px solid rgba(255,255,255,0.25); border-radius: 4px;
+            }
+            button:hover { background: rgba(255,255,255,0.18); }
+            code { background: rgba(255,255,255,0.08); padding: 0.1em 0.35em; border-radius: 3px; }
+            .note { margin-top: 1.5rem; color: rgba(255,255,255,0.5); max-width: 62rem; font-size: 0.85rem; }
+            .formula { color: rgba(255,255,255,0.75); }
+        </style>
+    </head>
+    <body>
+        <h1>zoom_to_cursor — desktop behaviour vs. the port</h1>
+        <p class="lede">
+            Both panes run identical camera maths ported from
+            <code>shared/camera.rs</code>, differing <em>only</em> in the sign of
+            one term. The white crosshair is the <strong>zoom point</strong>; the
+            red dot is the world point that sat under it when zooming began. A
+            correct zoom-to-cursor keeps the dot inside the crosshair.
+        </p>
+        <p class="lede">
+            <strong>Easiest way to see it:</strong> click
+            <em>Auto-zoom in ×12</em> below and just watch — it steps slowly, and
+            it drives a fixed point on the canvas, so it does not matter where
+            your mouse is. On the left the dot crawls out of the crosshair and
+            off the canvas (an arrow then points after it); on the right it stays
+            put. You can also hover either canvas and scroll by hand, in which
+            case the crosshair follows your pointer.
+        </p>
+
+        <div class="panes">
+            <div class="pane bad">
+                <h2>Desktop (current Rust)</h2>
+                <p class="sub">
+                    <span class="formula">pos += ndc · (1/z₁ − 1/z₀)</span><br />
+                    camera.rs:206 — the dot slides away from your pointer.
+                </p>
+                <canvas id="bad"></canvas>
+                <div class="readout" id="badOut"></div>
+            </div>
+
+            <div class="pane good">
+                <h2>Browser port (corrected)</h2>
+                <p class="sub">
+                    <span class="formula">pos += ndc · (1/z₀ − 1/z₁)</span><br />
+                    The negation — the dot stays under your pointer.
+                </p>
+                <canvas id="good"></canvas>
+                <div class="readout" id="goodOut"></div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <button id="reset">Reset both</button>
+            <button id="autoIn">Auto-zoom in ×12</button>
+            <button id="autoOut">Auto-zoom out ×12</button>
+        </div>
+
+        <p class="note">
+            The auto-zoom buttons apply twelve identical wheel steps at a fixed
+            point (75% across, 35% down) so both panes get exactly the same
+            input — the clearest way to see the divergence without a steady hand.
+            Drift is measured in screen pixels between your cursor and the world
+            point that was under it.
+        </p>
+        <p class="note">
+            <strong>Expect a small drift on the corrected pane when zooming
+            out.</strong> <code>camera.rs:106</code> clamps the camera position
+            to ±2 world units, and zooming out pushes the required offset past
+            that bound, so the anchor cannot be held. That clamp is faithfully
+            reproduced here; it is a separate constraint from the sign, and it
+            affects both panes. Zooming <em>in</em> isolates the sign cleanly —
+            the corrected pane holds the dot at 0.0 px, the desktop one throws it
+            roughly two thousand pixels away.
+        </p>
+
+        <script type="module">
+            // ---- Ported verbatim from src-tauri/src/simulations/shared/camera.rs ----
+
+            const MIN_ZOOM = 0.005;
+            const MAX_ZOOM = 50.0;
+            const SENSITIVITY = 1.0;
+
+            function makeCamera(useRustSign) {
+                return { pos: [0, 0], zoom: 1, useRustSign };
+            }
+
+            /** camera.rs:180 `zoom()` — including its change threshold. */
+            function applyZoom(cam, delta) {
+                const factor = 1 + delta * SENSITIVITY * 0.3;
+                const clamped = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, cam.zoom * factor));
+                const threshold = Math.max(cam.zoom * 0.001, 1e-6);
+                if (Math.abs(clamped - cam.zoom) > threshold) cam.zoom = clamped;
+            }
+
+            /** camera.rs:206 `zoom_to_cursor()`. */
+            function zoomToCursor(cam, delta, cx, cy, w, h) {
+                const z0 = cam.zoom;
+                applyZoom(cam, delta);
+                const z1 = cam.zoom;
+
+                const ndcX = (cx / w) * 2 - 1;
+                const ndcY = -((cy / h) * 2 - 1);
+
+                // Both spellings reduce to ndc * (1/zA - 1/zB); the Rust builds
+                // it as (ndc - newNdc) / z1, which expands to the first form.
+                const k = cam.useRustSign ? 1 / z1 - 1 / z0 : 1 / z0 - 1 / z1;
+
+                cam.pos[0] += ndcX * k;
+                cam.pos[1] += ndcY * k;
+
+                // camera.rs:106 position_clamp = Some((-2.0, 2.0))
+                cam.pos[0] = Math.min(2, Math.max(-2, cam.pos[0]));
+                cam.pos[1] = Math.min(2, Math.max(-2, cam.pos[1]));
+            }
+
+            const screenToWorld = (cam, x, y, w, h) => [
+                ((x / w) * 2 - 1) / cam.zoom + cam.pos[0],
+                -((y / h) * 2 - 1) / cam.zoom + cam.pos[1],
+            ];
+            const worldToScreen = (cam, wx, wy, w, h) => [
+                (((wx - cam.pos[0]) * cam.zoom + 1) / 2) * w,
+                ((-((wy - cam.pos[1]) * cam.zoom) + 1) / 2) * h,
+            ];
+
+            // ---- Rendering: a world-space grid so the zoom is legible --------
+
+            function draw(cv, cam, anchor, cursor) {
+                const dpr = Math.min(window.devicePixelRatio || 1, 2);
+                const w = cv.clientWidth, h = cv.clientHeight;
+                if (cv.width !== w * dpr || cv.height !== h * dpr) {
+                    cv.width = w * dpr; cv.height = h * dpr;
+                }
+                const g = cv.getContext('2d');
+                g.setTransform(dpr, 0, 0, dpr, 0, 0);
+                g.clearRect(0, 0, w, h);
+
+                // Grid lines every 0.25 world units, thicker on integers.
+                const step = 0.25;
+                const [x0, y1] = screenToWorld(cam, 0, 0, w, h);
+                const [x1, y0] = screenToWorld(cam, w, h, w, h);
+                g.lineWidth = 1;
+                for (let x = Math.floor(x0 / step) * step; x <= x1; x += step) {
+                    const [sx] = worldToScreen(cam, x, 0, w, h);
+                    const major = Math.abs(x % 1) < 1e-9;
+                    g.strokeStyle = major ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.10)';
+                    g.beginPath(); g.moveTo(sx, 0); g.lineTo(sx, h); g.stroke();
+                }
+                for (let y = Math.floor(y0 / step) * step; y <= y1; y += step) {
+                    const [, sy] = worldToScreen(cam, 0, y, w, h);
+                    const major = Math.abs(y % 1) < 1e-9;
+                    g.strokeStyle = major ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.10)';
+                    g.beginPath(); g.moveTo(0, sy); g.lineTo(w, sy); g.stroke();
+                }
+
+                // The anchor: the world point that was under the zoom point.
+                let drift = null;
+                if (anchor) {
+                    const [ax, ay] = worldToScreen(cam, anchor[0], anchor[1], w, h);
+                    if (cursor) drift = Math.hypot(ax - cursor[0], ay - cursor[1]);
+
+                    const onCanvas = ax >= 0 && ax <= w && ay >= 0 && ay <= h;
+
+                    if (onCanvas) {
+                        if (cursor && drift > 1.5) {
+                            g.strokeStyle = 'rgba(239,68,68,0.8)';
+                            g.setLineDash([4, 3]);
+                            g.beginPath();
+                            g.moveTo(cursor[0], cursor[1]); g.lineTo(ax, ay);
+                            g.stroke();
+                            g.setLineDash([]);
+                        }
+                        g.fillStyle = '#ef4444';
+                        g.beginPath(); g.arc(ax, ay, 6, 0, Math.PI * 2); g.fill();
+                        g.strokeStyle = 'rgba(255,255,255,0.9)'; g.lineWidth = 1.5; g.stroke();
+                    } else if (cursor) {
+                        // Off-canvas, which is exactly what the bug looks like at
+                        // speed. Draw an edge marker pointing at it rather than
+                        // silently showing nothing.
+                        const dx = ax - cursor[0], dy = ay - cursor[1];
+                        const len = Math.hypot(dx, dy) || 1;
+                        const ux = dx / len, uy = dy / len;
+                        // March from the cursor to the first canvas edge.
+                        let t = Infinity;
+                        if (ux > 0) t = Math.min(t, (w - 14 - cursor[0]) / ux);
+                        if (ux < 0) t = Math.min(t, (14 - cursor[0]) / ux);
+                        if (uy > 0) t = Math.min(t, (h - 14 - cursor[1]) / uy);
+                        if (uy < 0) t = Math.min(t, (14 - cursor[1]) / uy);
+                        const ex = cursor[0] + ux * t, ey = cursor[1] + uy * t;
+
+                        g.strokeStyle = 'rgba(239,68,68,0.85)';
+                        g.setLineDash([4, 3]); g.lineWidth = 1.5;
+                        g.beginPath(); g.moveTo(cursor[0], cursor[1]); g.lineTo(ex, ey); g.stroke();
+                        g.setLineDash([]);
+
+                        // Arrowhead at the edge.
+                        g.fillStyle = '#ef4444';
+                        g.save();
+                        g.translate(ex, ey); g.rotate(Math.atan2(uy, ux));
+                        g.beginPath(); g.moveTo(10, 0); g.lineTo(-6, 6); g.lineTo(-6, -6);
+                        g.closePath(); g.fill();
+                        g.restore();
+
+                        g.fillStyle = '#fca5a5';
+                        g.font = '600 11px ui-monospace, Menlo, monospace';
+                        g.textAlign = ux > 0 ? 'right' : 'left';
+                        g.fillText('off canvas', ex - ux * 18, ey - uy * 18 - 6);
+                    }
+                }
+
+                // The zoom point — where the dot is supposed to stay pinned.
+                if (cursor) {
+                    const [cx, cy] = cursor;
+                    g.strokeStyle = 'rgba(255,255,255,0.9)'; g.lineWidth = 1.5;
+                    g.beginPath();
+                    g.moveTo(cx - 10, cy); g.lineTo(cx + 10, cy);
+                    g.moveTo(cx, cy - 10); g.lineTo(cx, cy + 10);
+                    g.stroke();
+                    g.strokeStyle = 'rgba(255,255,255,0.45)'; g.lineWidth = 1;
+                    g.beginPath(); g.arc(cx, cy, 14, 0, Math.PI * 2); g.stroke();
+
+                    g.fillStyle = 'rgba(255,255,255,0.65)';
+                    g.font = '11px ui-monospace, Menlo, monospace';
+                    g.textAlign = 'left';
+                    g.fillText('zoom point', cx + 18, cy - 14);
+                }
+                return drift;
+            }
+
+            // ---- Wiring -----------------------------------------------------
+
+            const panes = [
+                { cv: document.getElementById('bad'), out: document.getElementById('badOut'),
+                  cam: makeCamera(true) },
+                { cv: document.getElementById('good'), out: document.getElementById('goodOut'),
+                  cam: makeCamera(false) },
+            ];
+            let anchor = null;   // shared world anchor, captured on first wheel
+            let cursor = null;   // shared cursor position in CSS px
+
+            function render() {
+                for (const p of panes) {
+                    const drift = draw(p.cv, p.cam, anchor, cursor);
+                    const stats =
+                        `zoom ${p.cam.zoom.toFixed(3)} · ` +
+                        `pos [${p.cam.pos[0].toFixed(3)}, ${p.cam.pos[1].toFixed(3)}]`;
+                    if (drift === null) {
+                        p.out.textContent = stats;
+                    } else {
+                        const cls = drift > 4 ? 'drift' : 'ok';
+                        p.out.innerHTML =
+                            `${stats} · drift <span class="${cls}">${drift.toFixed(1)} px</span>`;
+                    }
+                }
+            }
+
+            function wheelAt(cx, cy, delta) {
+                const { clientWidth: w, clientHeight: h } = panes[0].cv;
+                cursor = [cx, cy];
+                // Capture the anchor once, from the corrected camera, so both
+                // panes are judged against the same world point.
+                if (!anchor) anchor = screenToWorld(panes[1].cam, cx, cy, w, h);
+                for (const p of panes) zoomToCursor(p.cam, delta, cx, cy, w, h);
+                render();
+            }
+
+            for (const p of panes) {
+                p.cv.addEventListener('wheel', (e) => {
+                    e.preventDefault();
+                    const r = p.cv.getBoundingClientRect();
+                    wheelAt(e.clientX - r.left, e.clientY - r.top, -e.deltaY * 0.01);
+                }, { passive: false });
+
+                p.cv.addEventListener('pointermove', (e) => {
+                    const r = p.cv.getBoundingClientRect();
+                    cursor = [e.clientX - r.left, e.clientY - r.top];
+                    render();
+                });
+            }
+
+            document.getElementById('reset').addEventListener('click', () => {
+                panes[0].cam = makeCamera(true);
+                panes[1].cam = makeCamera(false);
+                anchor = null;
+                render();
+            });
+
+            /**
+             * Stepped slowly on purpose. At full speed the anchor leaves the
+             * left canvas within a couple of frames, so the pane that best
+             * shows the bug just looks empty — which reads as broken rather
+             * than as the point being made.
+             */
+            let autoTimer = null;
+            function auto(delta) {
+                clearInterval(autoTimer);
+                const { clientWidth: w, clientHeight: h } = panes[0].cv;
+                const cx = w * 0.75, cy = h * 0.35;
+
+                // Reset so every run starts from the same place.
+                panes[0].cam = makeCamera(true);
+                panes[1].cam = makeCamera(false);
+                anchor = null;
+                cursor = [cx, cy];
+                render();
+
+                let n = 0;
+                autoTimer = setInterval(() => {
+                    wheelAt(cx, cy, delta);
+                    if (++n >= 12) clearInterval(autoTimer);
+                }, 220);
+            }
+            document.getElementById('autoIn').addEventListener('click', () => auto(0.5));
+            document.getElementById('autoOut').addEventListener('click', () => auto(-0.5));
+
+            addEventListener('resize', render);
+            render();
+        </script>
+    </body>
+</html>
