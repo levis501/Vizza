@@ -15,10 +15,19 @@
  * exactly or the grid tears at its edge. Hence `calculateTileCount` below is a
  * literal port of the WGSL, and is unit-tested against it.
  *
- * Only the `fs_main_texture` entry point is used. The module also declares
- * bindings 3-7 for Gray-Scott's storage path (`fs_main`), but WebGPU only
- * requires a layout to cover the bindings an entry point *statically uses*, so
- * the pipeline layout here is just texture + sampler + render params + camera.
+ * Two of the module's three fragment entry points are used, and a renderer is
+ * built for one or the other (`path` below):
+ *
+ *   'texture' — `fs_main_texture`, bindings 0/1/2. Flow, Moiré, Pellets, Slime
+ *               Mold: sample an rgba texture and show it as-is.
+ *   'storage' — `fs_main`, a one-line wrapper around `fs_main_storage`, bindings
+ *               3/4/5/7. Gray-Scott: sample one *scalar* field out of the red
+ *               channel and colour it through a LUT.
+ *
+ * WebGPU only requires a layout to cover the bindings an entry point
+ * *statically uses*, so each path declares its own and neither carries the
+ * other's. Binding 6 (`params: SimulationParams`) is used by no entry point at
+ * all and appears in neither — sparse binding numbers with gaps are legal.
  */
 
 import { getShader } from '$lib/engine/shaders';
@@ -63,11 +72,19 @@ export function calculateTileCount(zoom: number): number {
     return Math.min(Math.max(tilesNeeded, minTiles), MAX_TILES_PER_AXIS);
 }
 
+/**
+ * Which fragment entry point — and therefore which bind-group shape — this
+ * renderer is built for. See the module comment.
+ */
+export type InfiniteRenderPath = 'texture' | 'storage';
+
 export interface InfiniteRendererOptions {
     label?: string;
     filteringMode?: TextureFilteringMode;
     /** Defaults to clearing black, as every Rust caller does. */
     clearValue?: GPUColor;
+    /** Defaults to 'texture', which is what the four RGBA simulations want. */
+    path?: InfiniteRenderPath;
 }
 
 export class InfiniteRenderer {
@@ -79,6 +96,7 @@ export class InfiniteRenderer {
     private readonly sampler: GPUSampler;
     private readonly renderParams: GPUBuffer;
     private readonly clearValue: GPUColor;
+    readonly path: InfiniteRenderPath;
 
     private cameraBindGroup: GPUBindGroup | null = null;
     private destroyed = false;
@@ -86,6 +104,7 @@ export class InfiniteRenderer {
     private constructor(
         device: GPUDevice,
         label: string,
+        path: InfiniteRenderPath,
         pipeline: GPURenderPipeline,
         sourceLayout: GPUBindGroupLayout,
         cameraLayout: GPUBindGroupLayout,
@@ -95,6 +114,7 @@ export class InfiniteRenderer {
     ) {
         this.device = device;
         this.label = label;
+        this.path = path;
         this.pipeline = pipeline;
         this.sourceLayout = sourceLayout;
         this.cameraLayout = cameraLayout;
@@ -109,27 +129,58 @@ export class InfiniteRenderer {
         options: InfiniteRendererOptions = {}
     ): Promise<InfiniteRenderer> {
         const label = options.label ?? 'infinite render';
+        const path = options.path ?? 'texture';
+        const storage = path === 'storage';
 
         const module = await createShaderModuleChecked(device, {
             label: `${label} shader`,
             code: getShader(INFINITE_RENDER_SHADER_PATH),
         });
 
+        // `fs_main_storage` reads `simulation_data`/`simulation_sampler` at 3/4,
+        // `lut_data` at 5 and `render_params` at 7 — and nothing at 0, 1, 2 or 6.
         const sourceLayout = device.createBindGroupLayout({
             label: `${label} source layout`,
-            entries: [
-                {
-                    binding: 0,
-                    visibility: GPUShaderStage.FRAGMENT,
-                    texture: { sampleType: 'float', viewDimension: '2d' },
-                },
-                {
-                    binding: 1,
-                    visibility: GPUShaderStage.FRAGMENT,
-                    sampler: { type: 'filtering' },
-                },
-                { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-            ],
+            entries: storage
+                ? [
+                      {
+                          binding: 3,
+                          visibility: GPUShaderStage.FRAGMENT,
+                          texture: { sampleType: 'float', viewDimension: '2d' },
+                      },
+                      {
+                          binding: 4,
+                          visibility: GPUShaderStage.FRAGMENT,
+                          sampler: { type: 'filtering' },
+                      },
+                      {
+                          binding: 5,
+                          visibility: GPUShaderStage.FRAGMENT,
+                          buffer: { type: 'read-only-storage' },
+                      },
+                      {
+                          binding: 7,
+                          visibility: GPUShaderStage.FRAGMENT,
+                          buffer: { type: 'uniform' },
+                      },
+                  ]
+                : [
+                      {
+                          binding: 0,
+                          visibility: GPUShaderStage.FRAGMENT,
+                          texture: { sampleType: 'float', viewDimension: '2d' },
+                      },
+                      {
+                          binding: 1,
+                          visibility: GPUShaderStage.FRAGMENT,
+                          sampler: { type: 'filtering' },
+                      },
+                      {
+                          binding: 2,
+                          visibility: GPUShaderStage.FRAGMENT,
+                          buffer: { type: 'uniform' },
+                      },
+                  ],
         });
 
         const cameraLayout = device.createBindGroupLayout({
@@ -148,9 +199,14 @@ export class InfiniteRenderer {
             vertex: { module, entryPoint: 'vs_main' },
             fragment: {
                 module,
-                entryPoint: 'fs_main_texture',
+                entryPoint: storage ? 'fs_main' : 'fs_main_texture',
                 targets: [
                     {
+                        // One/zero, i.e. REPLACE. The Rust asked for
+                        // ALPHA_BLENDING on the Gray-Scott pipeline
+                        // (simulation.rs:452), which is the same thing here:
+                        // `fs_main_storage` returns a hardcoded alpha of 1.0 and
+                        // discards anything else, so nothing is ever blended.
                         format,
                         blend: {
                             color: { srcFactor: 'one', dstFactor: 'zero', operation: 'add' },
@@ -165,17 +221,37 @@ export class InfiniteRenderer {
             primitive: { topology: 'triangle-list', frontFace: 'ccw', cullMode: 'none' },
         });
 
+        // The storage path wraps, the texture path clamps.
+        //
+        // Both are transcriptions, not preferences: gray_scott/simulation.rs:404
+        // asks for Repeat on all three axes and Linear mipmap filtering, while
+        // every texture-path caller asks for ClampToEdge. It matters — the
+        // Gray-Scott field is toroidal (the reaction wraps in `get_laplacian`)
+        // and the canvas tiles it, so clamping would smear the last row of
+        // texels across every tile seam.
         const sampler = device.createSampler({
             label: `${label} sampler`,
-            addressModeU: 'clamp-to-edge',
-            addressModeV: 'clamp-to-edge',
-            addressModeW: 'clamp-to-edge',
+            addressModeU: storage ? 'repeat' : 'clamp-to-edge',
+            addressModeV: storage ? 'repeat' : 'clamp-to-edge',
+            addressModeW: storage ? 'repeat' : 'clamp-to-edge',
             magFilter: 'linear',
             minFilter: 'linear',
-            mipmapFilter: 'nearest',
+            mipmapFilter: storage ? 'linear' : 'nearest',
         });
 
         // 16 B: one u32 plus three words of padding, as RenderParams declares.
+        //
+        // This is also remediation (2) for Gray-Scott. The Rust builds a
+        // correct 16-byte filtering-mode buffer from the app setting
+        // (`texture_render_params_buffer`, simulation.rs:400, kept up to date by
+        // `update_app_settings` at :683) and then **binds it nowhere**: binding 7
+        // gets the 68-byte `RenderSimulationParams` instead (simulation.rs:1330).
+        // The shader reads that as a 16-byte `RenderParams`, so `filtering_mode`
+        // is the f32 bit pattern of `feed_rate` — 0.055 gives ~1.03e9, neither 0
+        // nor 1 — and `fs_main_storage` falls into its `else` branch on every
+        // frame. The desktop build is therefore *always* Lanczos whatever the app
+        // setting says; binding the right 16 bytes makes Gray-Scott default to
+        // Linear like everything else, which is a visible change of appearance.
         const renderParams = createUniformBuffer(device, 16, { label: `${label} params` });
         const mode = options.filteringMode ?? TEXTURE_FILTERING.linear;
         device.queue.writeBuffer(renderParams, 0, new Uint32Array([mode, 0, 0, 0]));
@@ -183,6 +259,7 @@ export class InfiniteRenderer {
         return new InfiniteRenderer(
             device,
             label,
+            path,
             pipeline,
             sourceLayout,
             cameraLayout,
@@ -192,8 +269,9 @@ export class InfiniteRenderer {
         );
     }
 
-    /** One bind group per source texture view. */
+    /** One bind group per source texture view. Texture path only. */
     createSourceBindGroup(view: GPUTextureView, suffix = ''): GPUBindGroup {
+        this.requirePath('texture', 'createSourceBindGroup');
         return this.device.createBindGroup({
             label: `${this.label} source${suffix ? ` ${suffix}` : ''}`,
             layout: this.sourceLayout,
@@ -213,6 +291,52 @@ export class InfiniteRenderer {
             this.createSourceBindGroup(views[0], 'A'),
             this.createSourceBindGroup(views[1], 'B'),
         ];
+    }
+
+    /**
+     * One bind group per source view for the storage path, which additionally
+     * needs the 768-entry planar LUT the fragment shader colours through.
+     *
+     * `lut` is a `var<storage, read> array<u32>` rather than a texture — the
+     * same buffer shape Moiré's compute pass takes, indexed `[i]`, `[i+256]`,
+     * `[i+512]`.
+     */
+    createStorageSourceBindGroup(view: GPUTextureView, lut: GPUBuffer, suffix = ''): GPUBindGroup {
+        this.requirePath('storage', 'createStorageSourceBindGroup');
+        return this.device.createBindGroup({
+            label: `${this.label} source${suffix ? ` ${suffix}` : ''}`,
+            layout: this.sourceLayout,
+            entries: [
+                { binding: 3, resource: view },
+                { binding: 4, resource: this.sampler },
+                { binding: 5, resource: { buffer: lut } },
+                { binding: 7, resource: { buffer: this.renderParams } },
+            ],
+        });
+    }
+
+    /** Both orientations of a ping-pong pair, indexed by `currentIndex`. */
+    createStorageSourceBindGroups(
+        views: readonly [GPUTextureView, GPUTextureView],
+        lut: GPUBuffer
+    ): [GPUBindGroup, GPUBindGroup] {
+        return [
+            this.createStorageSourceBindGroup(views[0], lut, 'A'),
+            this.createStorageSourceBindGroup(views[1], lut, 'B'),
+        ];
+    }
+
+    /**
+     * A bind group built for the wrong entry point is a validation error whose
+     * message names binding numbers rather than the mistake, so it is caught
+     * here instead.
+     */
+    private requirePath(expected: InfiniteRenderPath, method: string): void {
+        if (this.path === expected) return;
+        throw new Error(
+            `${method} needs an InfiniteRenderer created with path: '${expected}', ` +
+                `but this one is '${this.path}'`
+        );
     }
 
     /**

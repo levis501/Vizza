@@ -51,6 +51,16 @@ interface ImageAware {
     loadImage(file: File, slot: string): Promise<void>;
 }
 
+/** Optional hook for a simulation whose Reset does more than rewind its clock. */
+interface Resettable {
+    reset(): void;
+}
+
+/** Optional hook for a simulation that can re-seed its field with noise. */
+interface NoiseSeedable {
+    seedRandomNoise(seed?: number): void;
+}
+
 export interface SimulationHostOptions {
     /** Override the module registry — the fake-engine and leak tests use this. */
     resolveFactory?: (id: SimulationId) => Promise<SimulationFactory>;
@@ -205,6 +215,26 @@ export class SimulationHost implements EngineContext {
 
     resetRuntimeState(): void {
         this.requireSimulation().resetRuntimeState();
+        this.loop.requestRedraw();
+    }
+
+    /**
+     * Optional capabilities rather than additions to the pinned `Simulation`
+     * interface, for the same reason `loadImage` is one: widening the interface
+     * for the one simulation that distinguishes reset-the-field from
+     * reset-the-clock would force ten no-op implementations.
+     */
+    resetSimulation(): void {
+        const simulation = this.requireSimulation() as Simulation & Partial<Resettable>;
+        if (typeof simulation.reset === 'function') simulation.reset();
+        else simulation.resetRuntimeState();
+        this.loop.requestRedraw();
+    }
+
+    seedRandomNoise(seed?: number): void {
+        const simulation = this.requireSimulation() as Partial<NoiseSeedable>;
+        if (typeof simulation.seedRandomNoise !== 'function') return;
+        simulation.seedRandomNoise(seed);
         this.loop.requestRedraw();
     }
 

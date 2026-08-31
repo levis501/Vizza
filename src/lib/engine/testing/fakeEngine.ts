@@ -25,12 +25,47 @@ import {
     normalizeMoireSettings,
     updateMoireSetting,
 } from '$lib/engine/sims/moire/settings';
+import {
+    defaultGrayScottSettings,
+    defaultGrayScottState,
+    normalizeGrayScottSettings,
+    updateGrayScottSetting,
+    updateGrayScottState,
+} from '$lib/engine/sims/grayScott/settings';
+
+/**
+ * Runtime state the moded UIs read when a simulation has no ported state model.
+ *
+ * Moiré's shape, because Moiré was the first mode wired up and its menu binds
+ * `color_scheme_name` / `color_scheme_reversed` directly.
+ */
+function legacyDefaultState(width: number, height: number): Record<string, unknown> {
+    return {
+        color_scheme_name: 'ZELDA_Fordite',
+        color_scheme_reversed: false,
+        time: 0,
+        width,
+        height,
+    };
+}
 
 /** How one simulation's settings behave, so the fake is not moiré-specific. */
 interface SettingsModel {
     defaults(): Record<string, unknown>;
     update(settings: Record<string, unknown>, name: string, value: unknown): void;
     normalize(input: unknown): Record<string, unknown>;
+    /**
+     * Runtime state, for a simulation whose menu reads more than the colour
+     * scheme. Optional: a mode with no state model keeps `legacyDefaultState`.
+     */
+    state?(): Record<string, unknown>;
+    /**
+     * Apply one `update_simulation_state`. Optional for the same reason, and
+     * worth providing where it exists: the real model *throws* on an unknown
+     * name, which is what `sync.ts` needs in order to roll an optimistic update
+     * back. A fake that accepts everything cannot exercise that path.
+     */
+    updateState?(state: Record<string, unknown>, name: string, value: unknown): void;
 }
 
 /**
@@ -56,6 +91,30 @@ const MODELS: Record<string, SettingsModel> = {
                 value
             ),
         normalize: (input) => normalizeMoireSettings(input) as unknown as Record<string, unknown>,
+    },
+    gray_scott: {
+        defaults: () => defaultGrayScottSettings() as unknown as Record<string, unknown>,
+        update: (settings, name, value) =>
+            void updateGrayScottSetting(
+                settings as unknown as Parameters<typeof updateGrayScottSetting>[0],
+                name,
+                value
+            ),
+        normalize: (input) =>
+            normalizeGrayScottSettings(input) as unknown as Record<string, unknown>,
+        state: () => defaultGrayScottState() as unknown as Record<string, unknown>,
+        // The mask enums round-trip through here, which is the whole point of
+        // giving Gray-Scott a real state model: `getState()` must hand back the
+        // *canonical* spelling of what was set, or the <Selector> in
+        // GrayScottMode falls back to its placeholder and its ◀/▶ buttons cycle
+        // from indexOf() === -1. A `state[name] = value` fake would echo
+        // whatever was sent and hide that entirely.
+        updateState: (state, name, value) =>
+            void updateGrayScottState(
+                state as unknown as Parameters<typeof updateGrayScottState>[0],
+                name,
+                value
+            ),
     },
 };
 
@@ -84,14 +143,10 @@ export class FakeEngine implements EngineContext {
 
     async start(simulationType: string): Promise<void> {
         this.simulationId = simulationType;
-        this.settings = this.model().defaults();
-        this.state = {
-            color_scheme_name: 'ZELDA_Fordite',
-            color_scheme_reversed: false,
-            time: 0,
-            width: this.viewport.width,
-            height: this.viewport.height,
-        };
+        const model = this.model();
+        this.settings = model.defaults();
+        this.state =
+            model.state?.() ?? legacyDefaultState(this.viewport.width, this.viewport.height);
         this.paused = false;
         this.record('start', simulationType);
 
@@ -140,8 +195,13 @@ export class FakeEngine implements EngineContext {
     }
 
     async updateState(name: string, value: unknown): Promise<void> {
-        this.state[name] = value;
+        // Recorded *before* the model runs, so a rejected value still shows up
+        // in the log as an attempt — a test asserting "the control reached the
+        // engine" should not depend on the value being accepted.
         this.record('update_simulation_state', { name, value });
+        const model = this.model();
+        if (model.updateState) model.updateState(this.state, name, value);
+        else this.state[name] = value;
     }
 
     applySettings(settings: Record<string, unknown>): void {
@@ -183,13 +243,42 @@ export class FakeEngine implements EngineContext {
         return { position: [...this.camera.position], zoom: this.camera.zoom };
     }
 
-    handleMouseInteraction(): void {}
+    /**
+     * Recorded rather than ignored.
+     *
+     * For a painting simulation this *is* the interaction under test — "left
+     * click seeds a reaction" is the only thing Gray-Scott's control panel
+     * advertises about the mouse — and a silent no-op here would let a mode
+     * that never reaches the engine pass every assertion.
+     */
+    handleMouseInteraction(canvasX: number, canvasY: number, button: number): void {
+        this.record('handle_mouse_interaction', { canvasX, canvasY, button });
+    }
 
-    handleMouseRelease(): void {}
+    handleMouseRelease(button: number): void {
+        this.record('handle_mouse_release', { button });
+    }
 
     resetRuntimeState(): void {
-        this.state.time = 0;
+        // Whichever spelling this simulation's state document uses — Moiré's is
+        // `time`, Gray-Scott's is `simulation_time`. Writing the wrong one would
+        // quietly add a field the real `getState()` never returns.
+        if ('simulation_time' in this.state) this.state.simulation_time = 0;
+        if ('time' in this.state) this.state.time = 0;
         this.record('reset_runtime_state', null);
+    }
+
+    /**
+     * Distinct from `resetRuntimeState` on purpose — see `EngineContext`. The
+     * fake records them under different names so a test can tell which one the
+     * Reset button actually reached.
+     */
+    resetSimulation(): void {
+        this.record('reset_simulation', null);
+    }
+
+    seedRandomNoise(seed?: number): void {
+        this.record('seed_random_noise', { seed: seed ?? null });
     }
 
     randomizeSettings(): void {

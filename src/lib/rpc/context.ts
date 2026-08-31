@@ -48,6 +48,27 @@ export interface EngineContext {
     handleMouseRelease(button: number): void;
 
     resetRuntimeState(): void;
+
+    /**
+     * The Reset button, which is not `resetRuntimeState`.
+     *
+     * The Rust kept these deliberately separate and Gray-Scott is where the
+     * difference first bites: its `reset_runtime_state` is a literal no-op
+     * (gray_scott/simulation.rs:1919), while `reset_simulation` blanks the
+     * chemical field through a different path entirely (manager.rs:1382).
+     * Routing both to `resetRuntimeState` — as this layer did until M4 — makes
+     * the button silently do nothing. Simulations that draw no distinction fall
+     * back to `resetRuntimeState`.
+     */
+    resetSimulation(): void;
+
+    /**
+     * Re-seed the field with noise. A no-op for simulations that have no such
+     * concept, which is most of them — Gray-Scott's control panel is the only
+     * one with the button today.
+     */
+    seedRandomNoise(seed?: number): void;
+
     randomizeSettings(): void;
     updateColorScheme(lut: Uint32Array, reversed: boolean): void;
 

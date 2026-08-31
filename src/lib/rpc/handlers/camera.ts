@@ -72,12 +72,13 @@ export function registerCameraHandlers(): void {
 
     register('reset_camera', async () => ifReady(() => getEngineContext().resetCamera()));
 
-    register('get_camera_state', async () => {
-        if (!hasEngineContext()) return { position: [0, 0], zoom: 1 };
-        const state = getEngineContext().getCameraState();
-        // The frontend reads snake_case fields off this object.
-        return { position: state.position, zoom: state.zoom };
-    });
+    /*
+     * `get_camera_state` was registered here until M4. GrayScottMode was its
+     * only caller and only `console.log`ed the result, so removing that call
+     * left the handler unreachable — which test/unit/registry.test.ts fails on
+     * by design. `SimulationHost.getCameraState()` still exists; re-register a
+     * command over it when a component genuinely needs to read the camera.
+     */
 
     register('set_camera_sensitivity', async (args) =>
         ifReady(() => getEngineContext().setCameraSensitivity(Number(args.sensitivity)))

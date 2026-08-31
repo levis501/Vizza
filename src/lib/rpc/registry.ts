@@ -101,11 +101,20 @@ for (const name of [
     'set_camera_sensitivity',
     'handle_mouse_interaction_screen',
     'handle_mouse_release',
-    'update_cursor_position_screen',
     'update_cursor_size',
     'update_cursor_strength',
 ]) stub(name);
-stub('get_camera_state', { position: [0, 0], zoom: 1 });
+/*
+ * `update_cursor_position_screen` and `get_camera_state` used to be stubbed
+ * here. GrayScottMode was the only caller of either, and M4 removed both calls:
+ * the first fired an awaited round-trip on every mousemove for a command whose
+ * Rust original ignores its arguments, and the second fetched a camera state
+ * that nothing consumed. The "no unreachable handlers" check in
+ * test/unit/registry.test.ts is what pairs a command with its call sites, so
+ * they are dropped rather than left dangling — `SimulationHost.getCameraState()`
+ * is untouched, and re-registering either is a six-line handler when a caller
+ * comes back.
+ */
 
 // ---------------------------------------------------------------------------
 // GUI and window
@@ -196,10 +205,12 @@ for (const name of [
 // Webcam — omitted from the browser port. Device enumeration returns empty so
 // WebcamControls reports "no devices" rather than erroring.
 // ---------------------------------------------------------------------------
-for (const sim of ['', 'gray_scott_', 'flow_', 'moire_', 'vectors_']) {
+// Gray-Scott's three are absent: M4 deleted its WebcamControls outright rather
+// than ship a Start button that is permanently greyed out, so nothing calls them.
+for (const sim of ['', 'flow_', 'moire_', 'vectors_']) {
     stub(`get_available_${sim}webcam_devices`, []);
 }
-for (const sim of ['slime_mold', 'gray_scott', 'flow', 'moire', 'vectors']) {
+for (const sim of ['slime_mold', 'flow', 'moire', 'vectors']) {
     stub(`start_${sim}_webcam_capture`);
     stub(`stop_${sim}_webcam_capture`);
 }

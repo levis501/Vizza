@@ -13,6 +13,7 @@
 
 <script lang="ts">
     import { createEventDispatcher, onMount } from 'svelte';
+    import { clientToCanvasPx } from '$lib/engine/gpu/pointer';
 
     export let xValue: number = 0;
     export let yValue: number = 0;
@@ -186,13 +187,33 @@
         return x >= plotX && x <= plotX + plotSize && y >= plotY && y <= plotY + plotSize;
     }
 
+    /**
+     * Pointer position in the canvas's own coordinates.
+     *
+     * Everything this component draws with — `plotX`, `plotSize`, `handle` —
+     * is in backing-store pixels, i.e. the `canvas.width`/`canvas.height`
+     * attributes. The element is laid out by CSS at `width: 100%`, and
+     * `handleResize` floors the backing store at 320px while these plots sit
+     * two-to-a-row in a menu about 600px wide, so the element renders at
+     * roughly 280px. The two spaces are therefore *never* equal here.
+     *
+     * The code used to take `clientX - rect.left` raw, which put the handle
+     * about 14% left of the cursor and worsening toward the right edge.
+     * `clientToCanvasPx` applies the measured `canvas.width / rect.width`
+     * ratio, which is the authoritative scale — see `engine/gpu/pointer.ts`.
+     */
+    function toCanvasPoint(event: PointerEvent): { x: number; y: number } {
+        return clientToCanvasPx(event.clientX, event.clientY, canvas.getBoundingClientRect(), {
+            width: canvas.width,
+            height: canvas.height,
+        });
+    }
+
     // Handle mouse/touch events
     function handlePointerDown(event: PointerEvent) {
         event.preventDefault();
 
-        const rect = canvas.getBoundingClientRect();
-        const x = event.clientX - rect.left;
-        const y = event.clientY - rect.top;
+        const { x, y } = toCanvasPoint(event);
 
         if (isNearHandle(x, y) || isInPlot(x, y)) {
             isDragging = true;
@@ -204,9 +225,7 @@
     function handlePointerMove(event: PointerEvent) {
         if (!isDragging) return;
 
-        const rect = canvas.getBoundingClientRect();
-        const x = event.clientX - rect.left;
-        const y = event.clientY - rect.top;
+        const { x, y } = toCanvasPoint(event);
 
         // Throttle updates to prevent feedback loops
         const now = Date.now();

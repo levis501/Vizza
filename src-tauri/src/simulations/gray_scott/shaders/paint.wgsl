@@ -13,18 +13,33 @@ struct PaintParams {
 }
 
 @group(0) @binding(0) var<uniform> params: PaintParams;
-@group(0) @binding(1) var uvs_texture: texture_storage_2d<rgba16float, read_write>;
+// Ping-pong instead of the in-place `texture_storage_2d<rgba16float, read_write>`
+// this used to be: core WebGPU allows read_write storage only on r32uint/r32sint/
+// r32float, so the in-place form is rejected at pipeline creation. The source is a
+// sampled texture rather than a read-only storage texture because the latter is a
+// WGSL feature not uniformly available outside Chrome.
+@group(0) @binding(1) var uvs_in: texture_2d<f32>;
+@group(0) @binding(2) var uvs_out: texture_storage_2d<rgba16float, write>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let x = i32(global_id.x);
     let y = i32(global_id.y);
-    
-    // Check bounds
+
+    // Check bounds. No copy-through here: these texels do not exist in the
+    // destination either.
     if (x >= i32(params.width) || y >= i32(params.height)) {
         return;
     }
-    
+
+    let coord = vec2<i32>(x, y);
+
+    // Read current UV values. Hoisted above the brush tests because every early-out
+    // below them must now copy the texel through: an untouched destination texel is
+    // not "unchanged", it is whatever this texture held two frames ago.
+    let current = textureLoad(uvs_in, coord, 0);
+    let current_uv = current.xy;
+
     // Convert mouse position to texture coordinates
     let mouse_x = i32(params.mouse_x * f32(params.width));
     let mouse_y = i32(params.mouse_y * f32(params.height));
@@ -38,21 +53,19 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let r2 = dx * dx + dy * dy;
     let radius2 = radius_px * radius_px;
     if (r2 > radius2) {
+        textureStore(uvs_out, coord, current);
         return;
     }
 
     // Smooth radial falloff
     let factor = 1.0 - sqrt(r2) / radius_px;
-    
+
     // Skip very small factors to reduce unnecessary updates
     if (factor < 0.01) {
+        textureStore(uvs_out, coord, current);
         return;
     }
-    
-    // Read current UV values
-    let current_sample = textureLoad(uvs_texture, vec2<i32>(x, y));
-    let current_uv = current_sample.xy;
-    
+
     // Apply painting based on mouse button
     var new_uv = current_uv;
     
@@ -69,6 +82,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
     // Middle mouse button (params.mouse_button == 1u): no effect
     
-    // Write back to texture
-    textureStore(uvs_texture, vec2<i32>(x, y), vec4<f32>(new_uv.x, new_uv.y, 0.0, 0.0));
+    // Write to the destination texture
+    textureStore(uvs_out, coord, vec4<f32>(new_uv.x, new_uv.y, 0.0, 0.0));
 }

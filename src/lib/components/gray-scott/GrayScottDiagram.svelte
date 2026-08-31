@@ -9,8 +9,8 @@
             <XYPlot
                 xValue={feedRate}
                 yValue={killRate}
-                xRange={feedRateRange}
-                yRange={killRateRange}
+                xRange={feedRatePlotRange}
+                yRange={killRatePlotRange}
                 xLabel="Feed Rate (F)"
                 yLabel="Kill Rate (K)"
                 title="Feed Rate (F) vs Kill Rate (K)"
@@ -30,8 +30,8 @@
             <XYPlot
                 xValue={diffusionRateU}
                 yValue={diffusionRateV}
-                xRange={diffusionRange}
-                yRange={diffusionRange}
+                xRange={diffusionUPlotRange}
+                yRange={diffusionVPlotRange}
                 xLabel="Diffusion Rate U (Du)"
                 yLabel="Diffusion Rate V (Dv)"
                 title="Diffusion Rate U (Du) vs Diffusion Rate V (Dv)"
@@ -113,19 +113,49 @@
     import XYPlot from './XYPlot.svelte';
     import NumberDragBox from '../inputs/NumberDragBox.svelte';
 
+    // `Settings::default()`, as ported in engine/sims/grayScott/settings.ts.
+    // These are placeholders — GrayScottMode always passes real values — but
+    // three of them had drifted from the model (0.1 / 0.05 / 1.0), which is
+    // exactly the kind of second copy that gets mistaken for the source.
     export let feedRate: number = 0.055;
     export let killRate: number = 0.062;
-    export let diffusionRateU: number = 0.1;
-    export let diffusionRateV: number = 0.05;
-    export let timestep: number = 1.0;
+    export let diffusionRateU: number = 0.16;
+    export let diffusionRateV: number = 0.08;
+    export let timestep: number = 2.5;
 
     const dispatch = createEventDispatcher();
 
-    // Parameter ranges
+    /*
+     * Two sets of ranges, on purpose.
+     *
+     * The `*Range` constants are what the desktop app used, and they stay on
+     * the NumberDragBoxes below so no value the engine accepts becomes
+     * unreachable from the UI.
+     *
+     * The `*PlotRange` constants are **narrower, and this is a deliberate
+     * divergence from the desktop app.** Gray-Scott's interesting domain is
+     * roughly F ∈ [0.01, 0.09] and K ∈ [0.03, 0.07]; all nine built-in presets
+     * live there, and `Settings::randomize` samples F ∈ [0.02, 0.08],
+     * K ∈ [0.04, 0.08], Du ∈ [0.1, 0.3], Dv ∈ [0.05, 0.15]. Plotted against
+     * the full 0.01–1.0 axis, every preset landed inside the first ~17px of a
+     * 220px axis and one pixel of drag moved F by ~0.0045 — 4.5x coarser than
+     * the `step={0.001}` of the drag box sitting right next to it, which made
+     * the plot strictly worse than the control it was meant to replace.
+     * Same story for diffusion: 0.16/0.08 against a 2.0 ceiling.
+     *
+     * Du and Dv get separate plot ranges rather than one shared one because
+     * their useful bands differ by about 2x; sharing squashed Dv into the
+     * bottom fifth of the Y axis.
+     */
     const feedRateRange = { min: 0.01, max: 1.0 };
     const killRateRange = { min: 0.01, max: 1.0 };
     const diffusionRange = { min: 0.01, max: 2.0 };
     const timestepRange = { min: 0.1, max: 10.0 };
+
+    const feedRatePlotRange = { min: 0.01, max: 0.1 };
+    const killRatePlotRange = { min: 0.03, max: 0.07 };
+    const diffusionUPlotRange = { min: 0.05, max: 0.3 };
+    const diffusionVPlotRange = { min: 0.02, max: 0.15 };
 
     // Internal state for timestep
     let internalTimestep = timestep;

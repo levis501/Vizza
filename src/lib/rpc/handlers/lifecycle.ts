@@ -88,7 +88,9 @@ export function registerLifecycleHandlers(): void {
 
     register('reset_runtime_state', async () => ifReady((c) => c.resetRuntimeState()));
 
-    register('reset_simulation', async () => ifReady((c) => c.resetRuntimeState()));
+    register('reset_simulation', async () => ifReady((c) => c.resetSimulation()));
+
+    register('seed_random_noise', async () => ifReady((c) => c.seedRandomNoise()));
 
     register('randomize_settings', async () => ifReady((c) => c.randomizeSettings()));
 

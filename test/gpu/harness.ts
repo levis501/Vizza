@@ -15,7 +15,11 @@ import { initGpu, isGpuFailure, describeGpuFailure } from '$lib/engine/gpu/devic
 import { deriveCaps, foldDispatch, SLIME_MOLD_AGENT_STRIDE } from '$lib/engine/gpu/limits';
 import { computeBackingSize, MAX_DEVICE_PIXEL_RATIO } from '$lib/engine/gpu/surface';
 import { createShaderModuleChecked } from '$lib/engine/gpu/errorScopes';
-import { createTexture2d, readTexturePixels } from '$lib/engine/resources/textures';
+import {
+    alignedBytesPerRow,
+    createTexture2d,
+    readTexturePixels,
+} from '$lib/engine/resources/textures';
 import { PingPongTextures } from '$lib/engine/resources/pingPong';
 import { BindGroupLayoutCache } from '$lib/engine/resources/bindGroupCache';
 import { readBuffer, createStorageBuffer, align } from '$lib/engine/resources/buffers';
@@ -24,7 +28,18 @@ import { PostProcessing, defaultPostProcessingState } from '$lib/engine/postproc
 import { MainMenuSimulation, defaultLut, reverseLut } from '$lib/engine/sims/mainMenu';
 import { MoireSimulation } from '$lib/engine/sims/moire';
 import { defaultMoireSettings } from '$lib/engine/sims/moire/settings';
-import { calculateTileCount } from '$lib/engine/render/InfiniteRenderer';
+import {
+    GrayScottSimulation,
+    decodeFloat16,
+    encodeFloat16,
+    SEED_DISC_RADIUS,
+} from '$lib/engine/sims/grayScott';
+import {
+    defaultGrayScottSettings,
+    defaultGrayScottState,
+    type GrayScottSettings,
+} from '$lib/engine/sims/grayScott/settings';
+import { calculateTileCount, TEXTURE_FILTERING } from '$lib/engine/render/InfiniteRenderer';
 import { ResourceLedger, instrumentDevice } from '$lib/engine/core/resourceLedger';
 import type { GpuContext } from '$lib/engine/types';
 import { shaderPathsNow, getShader } from './shaderShim';
@@ -960,6 +975,711 @@ test('moiré create/destroy x20 leaves the resource ledger clean', async () => {
     const probe = createStorageBuffer(gpu.device, 256, { label: 'post-moire probe' });
     const error = await gpu.device.popErrorScope();
     assert(error === null, `device unhealthy after 20 moiré cycles: ${error?.message}`);
+    probe.destroy();
+    churnTarget.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// Gray-Scott — M4
+// ---------------------------------------------------------------------------
+
+/**
+ * The concentration field, read back and decoded.
+ *
+ * `readTexturePixels` is rgba8-only; the field is rgba16float, so the halves
+ * are decoded here with the same routine the seeding path encodes with — which
+ * means a bug in `encodeFloat16` cannot hide by cancelling out, because the
+ * shader has read and rewritten every value in between.
+ */
+async function readField(texture: GPUTexture): Promise<{ u: Float32Array; v: Float32Array }> {
+    const width = texture.width;
+    const height = texture.height;
+    const bytesPerRow = alignedBytesPerRow(width, 8);
+
+    const staging = gpu.device.createBuffer({
+        label: 'gray-scott field readback',
+        size: bytesPerRow * height,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+
+    const encoder = gpu.device.createCommandEncoder({ label: 'gray-scott field readback' });
+    encoder.copyTextureToBuffer({ texture }, { buffer: staging, bytesPerRow }, { width, height });
+    gpu.device.queue.submit([encoder.finish()]);
+
+    await staging.mapAsync(GPUMapMode.READ);
+    const halves = new Uint16Array(staging.getMappedRange());
+    const stride = bytesPerRow / 2;
+
+    const u = new Float32Array(width * height);
+    const v = new Float32Array(width * height);
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const src = y * stride + x * 4;
+            const dst = y * width + x;
+            u[dst] = decodeFloat16(halves[src]);
+            v[dst] = decodeFloat16(halves[src + 1]);
+        }
+    }
+
+    staging.unmap();
+    staging.destroy();
+    return { u, v };
+}
+
+/** Both halves of a simulation's ping-pong pair, for the coherence assertions. */
+function fieldPair(sim: GrayScottSimulation): readonly [GPUTexture, GPUTexture] {
+    return (sim as unknown as { textures: { all: readonly [GPUTexture, GPUTexture] } }).textures
+        .all;
+}
+
+function meanAbsDiff(a: Float32Array, b: Float32Array): number {
+    assert(a.length === b.length, `field lengths differ: ${a.length} vs ${b.length}`);
+    let total = 0;
+    for (let i = 0; i < a.length; i++) total += Math.abs(a[i] - b[i]);
+    return total / a.length;
+}
+
+function maxAbsDiff(a: Float32Array, b: Float32Array): number {
+    let worst = 0;
+    for (let i = 0; i < a.length; i++) worst = Math.max(worst, Math.abs(a[i] - b[i]));
+    return worst;
+}
+
+function spread(values: Float32Array): number {
+    let min = Infinity;
+    let max = -Infinity;
+    for (const value of values) {
+        if (value < min) min = value;
+        if (value > max) max = value;
+    }
+    return max - min;
+}
+
+/** Round-trip through binary16, which is what storing a value in the field costs. */
+function quantizeHalf(value: number): number {
+    return decodeFloat16(encodeFloat16(value));
+}
+
+/**
+ * A CPU implementation of `reaction_diffusion.wgsl::main`, with the mask
+ * defaults (Disabled, so `mask_factor` is 1; UV Concentration, which scales the
+ * feed rate by `0.5 + mask_influence * 0.5`) and adaptive timestep off.
+ *
+ * Independent of the GPU path in everything but the arithmetic itself: it reads
+ * a whole field and writes a whole field, so it cannot reproduce a ping-pong
+ * mistake, a missed workgroup, or a bind group pointing at the wrong texture.
+ * Storage quantisation *is* modelled — every result goes through binary16, as
+ * the texture does — because without it the two would separate on rounding
+ * alone within a few steps and the comparison would mean nothing.
+ */
+function referenceSteps(
+    start: { u: Float32Array; v: Float32Array },
+    width: number,
+    height: number,
+    settings: GrayScottSettings,
+    steps: number
+): { u: Float32Array; v: Float32Array } {
+    let u = Float32Array.from(start.u);
+    let v = Float32Array.from(start.v);
+
+    // mask_factor 1 (Disabled) * mask_strength 0.5, into the UVConcentration arm.
+    const influence = 1.0 * defaultGrayScottState().mask_strength;
+    const feed = settings.feed_rate * (0.5 + influence * 0.5);
+    const kill = settings.kill_rate;
+    const dt = settings.timestep;
+
+    for (let step = 0; step < steps; step++) {
+        const nextU = new Float32Array(u.length);
+        const nextV = new Float32Array(v.length);
+
+        for (let y = 0; y < height; y++) {
+            const up = ((y - 1 + height) % height) * width;
+            const down = ((y + 1) % height) * width;
+            const row = y * width;
+
+            for (let x = 0; x < width; x++) {
+                const i = row + x;
+                const left = row + ((x - 1 + width) % width);
+                const right = row + ((x + 1) % width);
+
+                const lapU = -4 * u[i] + u[left] + u[right] + u[up + x] + u[down + x];
+                const lapV = -4 * v[i] + v[left] + v[right] + v[up + x] + v[down + x];
+                const reaction = u[i] * v[i] * v[i];
+
+                const du = settings.diffusion_rate_u * lapU - reaction + feed * (1 - u[i]);
+                const dv = settings.diffusion_rate_v * lapV + reaction - (kill + feed) * v[i];
+
+                nextU[i] = quantizeHalf(Math.min(1, Math.max(0, u[i] + du * dt)));
+                nextV[i] = quantizeHalf(Math.min(1, Math.max(0, v[i] + dv * dt)));
+            }
+        }
+
+        u = nextU;
+        v = nextV;
+    }
+
+    return { u, v };
+}
+
+/** The stable configuration the reference comparison runs at; see that test. */
+function stableSettings(): GrayScottSettings {
+    return { ...defaultGrayScottSettings(), timestep: 1.0 };
+}
+
+test('gray-scott constructs and tears down with no validation error', async () => {
+    gpu.device.pushErrorScope('validation');
+
+    const sim = await GrayScottSimulation.create(gpu);
+    const [target, view] = renderTarget(48, 'gray-scott validation target');
+
+    sim.renderFrame(view, 1 / 60);
+    sim.renderFramePaused(view);
+    sim.seedRandomNoise(7);
+    sim.handleMouseInteraction(0, 0, 0);
+    sim.reset();
+    sim.resize(320, 320);
+    sim.renderFrame(view, 1 / 60);
+    sim.destroy();
+    target.destroy();
+
+    const error = await gpu.device.popErrorScope();
+    assert(error === null, `gray-scott produced a validation error: ${error?.message}`);
+});
+
+test('the f16 encoder round-trips through a real rgba16float texture', async () => {
+    // Values chosen for what they exercise: the seeding constants, a subnormal,
+    // a half-way case that round-to-nearest-even must not bias, and an
+    // overflow that must become an infinity rather than wrapping to zero.
+    const values = [0, 1, 0.5, 0.99, 0.0625, 2 ** -20, -0.75, 65504, 100000];
+
+    for (const value of values) {
+        const back = decodeFloat16(encodeFloat16(value));
+        if (value === 100000) {
+            assert(back === Infinity, `${value} must saturate to Infinity, got ${back}`);
+            continue;
+        }
+        // Half has an 11-bit significand, so the relative error bound is 2^-11.
+        const tolerance = Math.max(Math.abs(value) * 2 ** -11, 2 ** -24);
+        assertClose(back, value, tolerance, `binary16 round-trip of ${value}`);
+    }
+
+    // And through the GPU, which is the claim that actually matters: the bytes
+    // this encoder produces are what an rgba16float texel means.
+    const width = 4;
+    const height = 2;
+    const texture = createTexture2d(gpu.device, width, height, {
+        label: 'f16 probe',
+        format: 'rgba16float',
+    });
+
+    const texels = new Uint16Array(width * height * 4);
+    for (let i = 0; i < width * height; i++) {
+        texels[i * 4] = encodeFloat16(i / 8);
+        texels[i * 4 + 1] = encodeFloat16(1 - i / 8);
+    }
+    gpu.device.queue.writeTexture(
+        { texture },
+        texels,
+        { bytesPerRow: width * 8, rowsPerImage: height },
+        { width, height, depthOrArrayLayers: 1 }
+    );
+
+    const { u, v } = await readField(texture);
+    for (let i = 0; i < width * height; i++) {
+        assertClose(u[i], i / 8, 1e-3, `texel ${i} red`);
+        assertClose(v[i], 1 - i / 8, 1e-3, `texel ${i} green`);
+    }
+
+    texture.destroy();
+});
+
+/**
+ * Pins remediation (1). The Rust uploads 16-byte `UVPair`s with
+ * `bytes_per_row: width * 16` into an 8-byte-per-texel texture, so `u = 1.0`
+ * arrives as roughly `u = 0, v = 1.875` in even columns and `(0,0,0,0)` in odd
+ * ones — a field that is *entirely* wrong, not subtly so. If this test ever
+ * reports u = 0 in half the columns, the seeding has been "restored" to the
+ * Rust's byte layout and the divergence note in `grayScottSeedTexels` needs
+ * revisiting rather than the test.
+ */
+test('gray-scott seeds U=1, V=0 with a live centre disc', async () => {
+    const sim = await GrayScottSimulation.create(gpu);
+    const [width, height] = sim.textureSize;
+    const { u, v } = await readField(sim.currentField);
+
+    const centerX = Math.trunc(width / 2);
+    const centerY = Math.trunc(height / 2);
+    const far = (centerY - 3 * SEED_DISC_RADIUS) * width + 4;
+
+    assertClose(u[far], 1, 1e-3, 'U away from the disc');
+    assertClose(v[far], 0, 1e-3, 'V away from the disc');
+    assert(u[0] === u[1], 'even and odd columns must agree — the f16 stride bug is back');
+
+    const middle = centerY * width + centerX;
+    assertClose(u[middle], 0.5, 1e-3, 'U at the centre of the disc');
+    assertClose(v[middle], 0.99, 1e-2, 'V at the centre of the disc');
+
+    // And exactly the disc: nothing outside the seeded square is disturbed.
+    let seeded = 0;
+    for (let i = 0; i < v.length; i++) if (v[i] > 0) seeded++;
+    const square = (2 * SEED_DISC_RADIUS + 1) ** 2;
+    assert(
+        seeded > 0 && seeded < square,
+        `expected the seed inside the ${square}-texel square, found ${seeded} live texels`
+    );
+
+    // The pair starts coherent: both halves hold the same initial condition.
+    const [a, b] = fieldPair(sim);
+    const fieldA = await readField(a);
+    const fieldB = await readField(b);
+    assert(meanAbsDiff(fieldA.u, fieldB.u) === 0, 'the two textures must start identical');
+
+    sim.destroy();
+});
+
+test('gray-scott settings and state round-trip through the simulation', async () => {
+    const sim = await GrayScottSimulation.create(gpu);
+
+    assert(
+        JSON.stringify(sim.getSettings()) === JSON.stringify(defaultGrayScottSettings()),
+        'a fresh simulation must report Settings::default()'
+    );
+
+    sim.updateSetting('feed_rate', 0.04);
+    // One of the three names the Rust silently dropped on the floor.
+    sim.updateSetting('max_timestep', 3.5);
+    assert(sim.getSettings().feed_rate === 0.04, 'feed_rate did not stick');
+    assert(sim.getSettings().max_timestep === 3.5, 'max_timestep did not stick');
+
+    sim.applySettings({ feed_rate: 0.03, kill_rate: 0.06 });
+    const applied = sim.getSettings();
+    assert(applied.feed_rate === 0.03, 'applySettings dropped an override');
+    assert(
+        applied.max_timestep === defaultGrayScottSettings().max_timestep,
+        'applySettings must reset unnamed fields'
+    );
+
+    sim.updateState('mask_pattern', 'Radial Gradient');
+    sim.updateState('current_color_scheme', 'MATPLOTLIB_prism');
+    const state = sim.getState();
+    assert(state.mask_pattern === 'Radial Gradient', 'mask_pattern did not stick');
+    assert(state.current_color_scheme === 'MATPLOTLIB_prism', 'the scheme name did not stick');
+    assert(
+        state.mask_image_base === undefined && state.mask_image_raw === undefined,
+        'the mask pixel arrays must never reach the state document'
+    );
+    assert(
+        Array.isArray(state.camera_position) && state.camera_position.length === 2,
+        'state must carry the camera position'
+    );
+
+    let threw = false;
+    try {
+        sim.updateState('not_a_state', 1);
+    } catch {
+        threw = true;
+    }
+    assert(threw, 'an unknown state name must reject, as the Rust does');
+
+    sim.destroy();
+});
+
+/**
+ * The milestone's named acceptance test.
+ *
+ * Ten steps of the ping-pong GPU pipeline against ten steps of an independent
+ * whole-field reference, from bit-identical initial conditions. It is the test
+ * that would catch a bind group reading the texture it is writing, a swap in
+ * the wrong place, and — since the 8x8 workgroup covers 64 texels where the
+ * shader used to declare one — a dispatch that only updates every 64th texel.
+ *
+ * Run at `timestep: 1.0` rather than the shipping 2.5. The von Neumann limit
+ * for these diffusion rates is 0.25/(0.16+0.08) = 1.04, so the *default*
+ * settings are past the stability boundary: a half-ulp of f16 rounding is
+ * amplified by 1.6 per step there and no reference could agree with anything
+ * after ten. That is a property of the shipping defaults, not of this port —
+ * `clamp` to [0,1] is what keeps the picture from exploding.
+ */
+test('gray-scott ping-pong matches an in-place reference after 10 steps', async () => {
+    const sim = await GrayScottSimulation.create(gpu);
+    const [target, view] = renderTarget(32, 'gray-scott reference target');
+    const [width, height] = sim.textureSize;
+
+    const settings = stableSettings();
+    sim.applySettings(settings);
+
+    // Seed from noise rather than the initial disc: the disc leaves 99.7% of
+    // the field at the fixed point u=1, v=0, where every implementation agrees
+    // trivially and the comparison would prove nothing.
+    sim.seedRandomNoise(20250101);
+    const start = await readField(sim.currentField);
+    assert(spread(start.u) > 0.5, 'the noise seed did not vary the field');
+
+    for (let i = 0; i < 10; i++) sim.renderFrame(view, 1 / 60);
+
+    const actual = await readField(sim.currentField);
+    const expected = referenceSteps(start, width, height, settings, 10);
+
+    assert(!hasNonFinite(actual.u) && !hasNonFinite(actual.v), 'the field went non-finite');
+    assert(
+        meanAbsDiff(actual.u, start.u) > 0.01,
+        'ten steps changed almost nothing — the compute pass is not running'
+    );
+
+    const meanU = meanAbsDiff(actual.u, expected.u);
+    const meanV = meanAbsDiff(actual.v, expected.v);
+    assert(meanU <= 5e-3, `U diverged from the reference: mean |delta| ${meanU.toFixed(6)}`);
+    assert(meanV <= 5e-3, `V diverged from the reference: mean |delta| ${meanV.toFixed(6)}`);
+
+    // And no single texel is wildly wrong, which a mean over 65k texels hides —
+    // one missed workgroup is 64 texels, 0.1% of the field.
+    const worstU = maxAbsDiff(actual.u, expected.u);
+    assert(worstU <= 0.1, `one texel is far off the reference: max |delta| ${worstU.toFixed(4)}`);
+
+    sim.destroy();
+    target.destroy();
+});
+
+test('the gray-scott field stays bounded and NaN-free over 60 steps', async () => {
+    const [target, view] = renderTarget(32, 'gray-scott stability target');
+
+    // Three configurations: the shipping defaults (which are past the von
+    // Neumann limit, see above), and the two degenerate adaptive-timestep cases
+    // the guard in `guardedSettings` exists for. `0.25 / (delta_u + delta_v)`
+    // and `1.0 / (1.0 + feed + kill)` are both unguarded in the shader, and
+    // settings.ts deliberately clamps nothing, so both denominators really can
+    // reach zero from the UI.
+    for (const [label, overrides] of [
+        ['defaults', {}],
+        [
+            'adaptive with zero diffusion',
+            { enable_adaptive_timestep: true, diffusion_rate_u: 0, diffusion_rate_v: 0 },
+        ],
+        [
+            'adaptive with both stability limits degenerate',
+            {
+                enable_adaptive_timestep: true,
+                diffusion_rate_u: 0,
+                diffusion_rate_v: 0,
+                feed_rate: -0.5,
+                kill_rate: -0.5,
+            },
+        ],
+    ] as const) {
+        const sim = await GrayScottSimulation.create(gpu);
+        sim.applySettings({ ...defaultGrayScottSettings(), ...overrides });
+        sim.seedRandomNoise(99);
+
+        for (let step = 0; step < 60; step++) sim.renderFrame(view, 1 / 60);
+
+        const { u, v } = await readField(sim.currentField);
+        assert(!hasNonFinite(u), `${label}: U went non-finite`);
+        assert(!hasNonFinite(v), `${label}: V went non-finite`);
+        for (let i = 0; i < u.length; i++) {
+            assert(u[i] >= 0 && u[i] <= 1, `${label}: U left [0,1] at texel ${i}: ${u[i]}`);
+            assert(v[i] >= 0 && v[i] <= 1, `${label}: V left [0,1] at texel ${i}: ${v[i]}`);
+        }
+
+        sim.destroy();
+    }
+
+    target.destroy();
+});
+
+test('noise seeding is deterministic and leaves the pair coherent', async () => {
+    const first = await GrayScottSimulation.create(gpu);
+    const second = await GrayScottSimulation.create(gpu);
+
+    first.seedRandomNoise(4242);
+    second.seedRandomNoise(4242);
+
+    const [a, b] = fieldPair(first);
+    const fieldA = await readField(a);
+    const fieldB = await readField(b);
+    assert(
+        meanAbsDiff(fieldA.u, fieldB.u) === 0 && meanAbsDiff(fieldA.v, fieldB.v) === 0,
+        'both halves of the pair must be seeded with the same noise, or the first ' +
+            'step reads a field the paint pass never wrote'
+    );
+    assert(spread(fieldA.v) > 0.5, 'the noise seed produced a flat field');
+
+    const other = await readField(second.currentField);
+    assert(
+        meanAbsDiff(fieldA.u, other.u) === 0,
+        'the same seed must produce the same field on two simulations'
+    );
+
+    second.seedRandomNoise(4243);
+    const different = await readField(second.currentField);
+    assert(meanAbsDiff(fieldA.u, different.u) > 0, 'a different seed produced the same field');
+
+    first.destroy();
+    second.destroy();
+});
+
+/**
+ * The copy-through invariant, which is the whole point of remediation (c).
+ *
+ * `paint.wgsl` used to be an in-place `read_write` pass — illegal on
+ * rgba16float in core WebGPU — and is now ping-pong, so every texel of the
+ * destination has to be written even where the brush does nothing. A texel the
+ * shader skips is not "unchanged": it holds whatever that texture contained two
+ * frames ago. The reaction step below is what makes the two halves differ, so a
+ * missing copy-through shows up as a whole field jumping backwards in time
+ * rather than as a subtle artefact.
+ */
+test('gray-scott paint writes every destination texel', async () => {
+    const sim = await GrayScottSimulation.create(gpu);
+    const [target, view] = renderTarget(32, 'gray-scott paint target');
+    const [width, height] = sim.textureSize;
+
+    sim.updateState('cursor_size', 0.2);
+    sim.updateState('cursor_strength', 1.0);
+    sim.seedRandomNoise(31337);
+    // One step, so `current` and `inactive` no longer agree.
+    sim.renderFrame(view, 1 / 60);
+
+    const before = await readField(sim.currentField);
+    // World (0,0) is the centre of the tile under an unmoved camera.
+    sim.handleMouseInteraction(0, 0, 0);
+    const after = await readField(sim.currentField);
+
+    // paint.wgsl:44 — the brush centre and radius, in texels.
+    const mouseX = Math.trunc(0.5 * width);
+    const mouseY = Math.trunc(0.5 * height);
+    const radius = Math.max(0.2 * (Math.min(width, height) * 0.5), 1);
+
+    let changedInside = 0;
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const i = y * width + x;
+            const distance = Math.hypot(x - mouseX, y - mouseY);
+
+            if (distance > radius + 1) {
+                // Outside the brush the shader copies the source texel through,
+                // and f16 -> f32 -> f16 is exact, so this is equality and not a
+                // tolerance.
+                assert(
+                    after.u[i] === before.u[i] && after.v[i] === before.v[i],
+                    `texel (${x},${y}) outside the brush changed: ` +
+                        `u ${before.u[i]} -> ${after.u[i]}. Either the paint pass ` +
+                        `skipped it, leaving a two-frame-stale texel, or the brush ` +
+                        `geometry no longer matches paint.wgsl.`
+                );
+            } else if (
+                distance < radius * 0.5 &&
+                (after.u[i] !== before.u[i] || after.v[i] !== before.v[i])
+            ) {
+                // U *and* V, because the left button mixes U towards
+                // `cursor_strength` — 1.0 here — and most of the field is
+                // already at U = 1, so U alone barely moves.
+                changedInside++;
+            }
+        }
+    }
+
+    assert(changedInside > 20, `the brush changed only ${changedInside} texels`);
+
+    sim.destroy();
+    target.destroy();
+});
+
+test('gray-scott paint buttons follow the shader', async () => {
+    const sim = await GrayScottSimulation.create(gpu);
+    const [width, height] = sim.textureSize;
+
+    sim.updateState('cursor_size', 0.3);
+    sim.updateState('cursor_strength', 1.0);
+    sim.seedRandomNoise(5150);
+
+    const before = await readField(sim.currentField);
+
+    // Middle button: the shader has no arm for it, so the whole field is copied
+    // through unchanged — which is only true if the copy-through works.
+    sim.handleMouseInteraction(0, 0, 1);
+    const middle = await readField(sim.currentField);
+    assert(
+        meanAbsDiff(before.u, middle.u) === 0 && meanAbsDiff(before.v, middle.v) === 0,
+        'the middle button must leave the field exactly as it was'
+    );
+
+    // Right button erases towards U=1, V=0 at full strength.
+    sim.handleMouseInteraction(0, 0, 2);
+    const erased = await readField(sim.currentField);
+    const centre = Math.trunc(height / 2) * width + Math.trunc(width / 2);
+    assertClose(erased.u[centre], 1, 0.01, 'right-button U at the brush centre');
+    assertClose(erased.v[centre], 0, 0.01, 'right-button V at the brush centre');
+
+    // A click outside [0,1]^2 in texture space paints nothing at all: world
+    // (5, 5) is five tiles away.
+    const untouched = await readField(sim.currentField);
+    sim.handleMouseInteraction(5, 5, 0);
+    const stillUntouched = await readField(sim.currentField);
+    assert(
+        meanAbsDiff(untouched.u, stillUntouched.u) === 0,
+        'a click outside the field must be ignored, not wrapped into it'
+    );
+
+    sim.destroy();
+});
+
+test('gray-scott renders a varied, finite, deterministic image', async () => {
+    const [target, view] = renderTarget(64, 'gray-scott render target');
+
+    const run = async (): Promise<Uint8Array> => {
+        const sim = await GrayScottSimulation.create(gpu);
+        sim.applySettings(stableSettings());
+        sim.seedRandomNoise(777);
+        for (let i = 0; i < 12; i++) sim.renderFrame(view, 1 / 60);
+        const pixels = await readTexturePixels(gpu.device, target);
+        sim.destroy();
+        return pixels;
+    };
+
+    const first = await run();
+    assert(!hasNonFinite(first), 'gray-scott produced non-finite pixels');
+    assert(!isUniform(first), 'gray-scott produced a flat image — the LUT path did nothing');
+
+    const alpha = channelStats(first, channelOffset(gpu.format, 'a'));
+    assert(alpha.min === 255, `gray-scott must be opaque; found alpha down to ${alpha.min}`);
+
+    const red = channelStats(first, channelOffset(gpu.format, 'r'));
+    assert(red.deviation > 2, `image is nearly flat: red deviation ${red.deviation.toFixed(2)}`);
+
+    const second = await run();
+    const mae = meanAbsoluteError(first, second);
+    assert(mae <= 1, `two identical runs diverged by MAE ${mae.toFixed(3)}`);
+
+    target.destroy();
+});
+
+/**
+ * Pins remediation (2): `filtering_mode` is the app setting, and the default is
+ * Linear.
+ *
+ * On the desktop the 16-byte filtering-mode buffer is built, kept up to date and
+ * bound nowhere — binding 7 gets a 68-byte struct instead, so the shader reads
+ * `feed_rate`'s bit pattern as the mode and always takes the Lanczos branch. The
+ * two assertions here are what tells the difference: the mode must *matter*, and
+ * the default must be the Linear branch rather than the Lanczos one.
+ */
+test('gray-scott honours the texture filtering setting', async () => {
+    const sim = await GrayScottSimulation.create(gpu);
+    // 48, deliberately not a divisor of the 256-texel field. At 64 every
+    // fragment's `tex_x` lands exactly on a texel boundary, and there the
+    // Lanczos kernel is 1 at offset 0 and *exactly* 0 at every integer offset —
+    // so it degenerates to the same bilinear tap as the Linear branch and the
+    // two modes are bit-identical. A real property of the shader, and a very
+    // convincing way for this test to prove nothing.
+    const [target, view] = renderTarget(48, 'gray-scott filtering target');
+
+    // The raw noise field, with no reaction steps: per-texel detail at a 4:1
+    // minification is where a 5x5 Lanczos gather and a 2x2 bilinear tap
+    // disagree most. A settled pattern is smooth, and every filter agrees on
+    // smooth.
+    sim.seedRandomNoise(2024);
+
+    sim.renderFramePaused(view);
+    const byDefault = await readTexturePixels(gpu.device, target);
+
+    sim.setFilteringMode(TEXTURE_FILTERING.lanczos);
+    sim.renderFramePaused(view);
+    const lanczos = await readTexturePixels(gpu.device, target);
+
+    sim.setFilteringMode(TEXTURE_FILTERING.linear);
+    sim.renderFramePaused(view);
+    const linear = await readTexturePixels(gpu.device, target);
+
+    assert(
+        meanAbsoluteError(byDefault, linear) === 0,
+        'the default filtering mode is not Linear — binding 7 may be the 68-byte struct again'
+    );
+    const lanczosDelta = meanAbsoluteError(byDefault, lanczos);
+    assert(
+        lanczosDelta > 0.5,
+        `switching to Lanczos changed almost nothing (MAE ${lanczosDelta.toFixed(3)}), ` +
+            `so filtering_mode is not being read`
+    );
+
+    sim.destroy();
+    target.destroy();
+});
+
+test('the gray-scott image mask reaches the reaction', async () => {
+    const [target, view] = renderTarget(32, 'gray-scott mask target');
+
+    const run = async (withMask: boolean): Promise<Float32Array> => {
+        const sim = await GrayScottSimulation.create(gpu);
+        sim.applySettings(stableSettings());
+        sim.updateState('mask_target', 'Feed Rate');
+        sim.updateState('mask_strength', 1.0);
+
+        if (withMask) {
+            const [width] = sim.textureSize;
+            await sim.loadImage(await splitImageFile(width));
+            assert(sim.hasImage, 'loadImage must leave a gradient map uploaded');
+            sim.updateState('mask_image_fit_mode', 'Stretch');
+            sim.updateState('mask_pattern', 'Image');
+        }
+
+        sim.seedRandomNoise(8080);
+        for (let i = 0; i < 20; i++) sim.renderFrame(view, 1 / 60);
+        const { u } = await readField(sim.currentField);
+        sim.destroy();
+        return u;
+    };
+
+    const plain = await run(false);
+    const masked = await run(true);
+
+    assert(!hasNonFinite(masked), 'the mask path produced non-finite values');
+    assert(
+        meanAbsDiff(plain, masked) > 1e-3,
+        'selecting the Image mask pattern changed nothing — the gradient buffer is ' +
+            'not reaching binding 3, or the u8 image was never converted to f32'
+    );
+
+    target.destroy();
+});
+
+test('gray-scott create/destroy x20 leaves the resource ledger clean', async () => {
+    const ledger = new ResourceLedger();
+    const instrumented: GpuContext = { ...gpu, device: instrumentDevice(gpu.device, ledger) };
+
+    const churnTarget = gpu.device.createTexture({
+        label: 'gray-scott churn target',
+        size: { width: 32, height: 32 },
+        format: gpu.format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    const churnView = churnTarget.createView();
+
+    for (let i = 0; i < 20; i++) {
+        const sim = await GrayScottSimulation.create(instrumented);
+        // Paint as well as render: the paint path is the one that could
+        // plausibly allocate per event, which is exactly what the Rust does.
+        sim.handleMouseInteraction(0, 0, 0);
+        sim.renderFrame(churnView, 1 / 60);
+        sim.destroy();
+        sim.destroy();
+    }
+
+    const stats = ledger.stats();
+    // Nine per simulation: five uniform/storage buffers, the two field
+    // textures, the camera uniform and the renderer's params buffer.
+    assert(
+        stats.created >= 20 * 9,
+        `expected at least nine tracked objects per simulation, saw ${stats.created} over 20`
+    );
+    assert(
+        stats.live === 0,
+        `${stats.live} GPU objects leaked over 20 cycles: ${JSON.stringify(stats.byLabel)}`
+    );
+
+    gpu.device.pushErrorScope('validation');
+    const probe = createStorageBuffer(gpu.device, 256, { label: 'post-gray-scott probe' });
+    const error = await gpu.device.popErrorScope();
+    assert(error === null, `device unhealthy after 20 gray-scott cycles: ${error?.message}`);
     probe.destroy();
     churnTarget.destroy();
 });

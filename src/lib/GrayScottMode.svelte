@@ -280,12 +280,14 @@
                                 }
                             }}
                         />
-                        <WebcamControls
-                            {webcamDevices}
-                            {webcamActive}
-                            onStartWebcam={startWebcam}
-                            onStopWebcam={stopWebcam}
-                        />
+                        <!--
+                            No WebcamControls here. Webcam is an explicitly
+                            omitted feature of the browser port (WEB_PORT.md),
+                            so `get_available_gray_scott_webcam_devices` returns
+                            [] forever and the Start button rendered permanently
+                            greyed out — a control that advertises a capability
+                            the app does not have. Hidden rather than disabled.
+                        -->
                     {/if}
                 {/if}
             </fieldset>
@@ -298,8 +300,7 @@
 
 <script lang="ts">
     import { createEventDispatcher, onMount, onDestroy } from 'svelte';
-    import { invoke } from '$lib/rpc';
-    import { listen } from '$lib/rpc';
+    import { invoke, listen } from '$lib/rpc';
     import SimulationLayout from './components/shared/SimulationLayout.svelte';
     import ColorSchemeSelector from './components/shared/ColorSchemeSelector.svelte';
     import GrayScottDiagram from './components/gray-scott/GrayScottDiagram.svelte';
@@ -311,41 +312,12 @@
     import Button from './components/shared/Button.svelte';
     import Selector from './components/inputs/Selector.svelte';
     import ImageSelector from './components/shared/ImageSelector.svelte';
-    import WebcamControls from './components/shared/WebcamControls.svelte';
+    import { MASK_PATTERNS, MASK_TARGETS } from '$lib/engine/sims/grayScott/settings';
     import { AutoHideManager, createAutoHideEventListeners } from './utils/autoHide';
     import { createSyncManager } from './utils/sync';
     import './shared-theme.css';
 
     const dispatch = createEventDispatcher();
-    // Webcam state
-    let webcamDevices: number[] = [];
-    let webcamActive = false;
-
-    async function startWebcam() {
-        try {
-            await invoke('start_gray_scott_webcam_capture');
-            webcamActive = true;
-        } catch (e) {
-            console.error('Failed to start Gray-Scott webcam:', e);
-        }
-    }
-
-    async function stopWebcam() {
-        try {
-            await invoke('stop_gray_scott_webcam_capture');
-            webcamActive = false;
-        } catch (e) {
-            console.error('Failed to stop Gray-Scott webcam:', e);
-        }
-    }
-
-    async function loadGrayScottWebcams() {
-        try {
-            webcamDevices = await invoke('get_available_gray_scott_webcam_devices');
-        } catch (e) {
-            console.error('Failed to load Gray-Scott webcam devices:', e);
-        }
-    }
 
     export let menuPosition: string = 'middle';
     export let autoHideDelay: number = 3000;
@@ -413,27 +385,25 @@
     let available_presets: string[] = [];
     let available_luts: string[] = [];
 
-    // Mask pattern options (display names match backend serialization)
-    const mask_pattern_options: string[] = [
-        'Disabled',
-        'Checkerboard',
-        'Diagonal Gradient',
-        'Radial Gradient',
-        'Vertical Stripes',
-        'Horizontal Stripes',
-        'Wave Function',
-        'Cosine Grid',
-        'Image',
-    ];
-
-    // Mask target options
-    const mask_target_options: string[] = [
-        'Feed Rate',
-        'Kill Rate',
-        'Diffusion U',
-        'Diffusion V',
-        'UV Concentration',
-    ];
+    /**
+     * The two mask enums, taken from the engine rather than retyped.
+     *
+     * These lists have to be *character-identical* to what `get_current_state`
+     * returns, because `Selector.svelte` compares with `options.includes(value)`
+     * and `options.indexOf(value)`. On the desktop build they were not: the UI
+     * listed display names ("Diagonal Gradient") while serde emitted PascalCase
+     * ("DiagonalGradient"), so after any state sync — a preset, a colour scheme,
+     * a reversed toggle — the selector fell back to its placeholder and its ◀/▶
+     * buttons cycled from `indexOf() === -1`, jumping to the last/first option.
+     * Six of the nine patterns and all five targets were affected, and the
+     * optimistic local write hid it until the next sync.
+     *
+     * `sims/grayScott/settings.ts` makes the display spelling canonical, so
+     * importing its arrays here is what makes the two sides unable to drift
+     * again — a hand-maintained copy is exactly how they diverged.
+     */
+    const mask_pattern_options: string[] = [...MASK_PATTERNS];
+    const mask_target_options: string[] = [...MASK_TARGETS];
 
     async function updateMaskPattern(value: string) {
         if (!state) return;
@@ -697,34 +667,21 @@
     let simulationResumedUnlisten: (() => void) | null = null;
     let fpsUpdateUnlisten: (() => void) | null = null;
 
-    // Add a function to fetch the latest camera state from the backend
-    async function fetchCameraState() {
-        try {
-            const cam = (await invoke('get_camera_state')) as {
-                position: number[];
-                zoom: number;
-                viewport_width: number;
-                viewport_height: number;
-                aspect_ratio: number;
-            };
-            if (cam) {
-                console.log('Camera state fetched:', cam);
-            }
-        } catch (e) {
-            console.error('Failed to fetch camera state:', e);
-        }
-    }
-
-    async function sendCursorToBackend(screenX: number, screenY: number) {
-        try {
-            await invoke('update_cursor_position_screen', {
-                screenX,
-                screenY,
-            });
-        } catch (err) {
-            console.error('Failed to update cursor position:', err);
-        }
-    }
+    /*
+     * Two functions used to live here and both were removed.
+     *
+     * `fetchCameraState()` invoked `get_camera_state` on init and did nothing
+     * with the result but `console.log` it. Its comment claimed it was needed
+     * "to get correct viewport dimensions", which was true of the Tauri build;
+     * in the browser the canvas owns its own size through a ResizeObserver
+     * (gpu/surface.ts), so there was nothing left for it to feed.
+     *
+     * `sendCursorToBackend()` invoked `update_cursor_position_screen` on *every*
+     * mousemove, awaited, for a command that is a stub here and whose Rust
+     * original ignores its arguments outright. The "golden crosshair" the call
+     * site promised is unimplemented on both sides, so this was an unthrottled
+     * round-trip per pointer sample in exchange for nothing.
+     */
 
     // Mouse state tracking for dragging support
     let isMousePressed = false;
@@ -733,6 +690,11 @@
     // Mouse event handling for camera controls and simulation interaction
     async function handleMouseEvent(e: CustomEvent) {
         const event = e.detail as MouseEvent | WheelEvent;
+
+        // Painting counts as using the app. Without this the auto-hide timer
+        // was never reset by interaction with the simulation itself, so the
+        // controls faded out mid-stroke. MoireMode does the same.
+        if (autoHideManager) autoHideManager.handleUserInteraction();
 
         if (event.type === 'wheel') {
             const wheelEvent = event as WheelEvent;
@@ -782,31 +744,27 @@
         } else if (event.type === 'mousemove') {
             const mouseEvent = event as MouseEvent;
 
+            // Nothing to do unless a button is down: the only thing the
+            // non-dragging branch ever did was the removed cursor-position
+            // round-trip.
+            if (!isMousePressed) return;
+
+            // Continue interaction while dragging
+            mouseEvent.preventDefault();
+
             // Convert screen coordinates to physical coordinates
             const devicePixelRatio = window.devicePixelRatio || 1;
             const physicalCursorX = mouseEvent.clientX * devicePixelRatio;
             const physicalCursorY = mouseEvent.clientY * devicePixelRatio;
 
-            if (isMousePressed) {
-                // Continue interaction while dragging
-                mouseEvent.preventDefault();
-
-                try {
-                    await invoke('handle_mouse_interaction_screen', {
-                        screenX: physicalCursorX,
-                        screenY: physicalCursorY,
-                        mouseButton: currentMouseButton,
-                    });
-                } catch (e) {
-                    console.error('Failed to handle Gray-Scott mouse drag:', e);
-                }
-            } else {
-                // Just update cursor position for visual feedback when not dragging
-                try {
-                    await sendCursorToBackend(physicalCursorX, physicalCursorY);
-                } catch (e) {
-                    console.error('Failed to update cursor position:', e);
-                }
+            try {
+                await invoke('handle_mouse_interaction_screen', {
+                    screenX: physicalCursorX,
+                    screenY: physicalCursorY,
+                    mouseButton: currentMouseButton,
+                });
+            } catch (e) {
+                console.error('Failed to handle Gray-Scott mouse drag:', e);
             }
         } else if (event.type === 'mouseup') {
             const mouseEvent = event as MouseEvent;
@@ -874,6 +832,22 @@
     async function updateLut(name: string) {
         try {
             await invoke('apply_color_scheme_by_name', { colorSchemeName: name });
+            /*
+             * `apply_color_scheme_by_name` pushes the LUT at the simulation
+             * (handlers/colorSchemes.ts -> updateColorScheme) but never writes
+             * the *name* into simulation state — the engine seam only carries
+             * the bytes and the reversed flag. The <Selector> above reads
+             * `state.current_color_scheme`, so without this second call the
+             * highlight snapped back to whatever the last sync returned.
+             * MoireMode.svelte:644 does exactly this for `color_scheme_name`.
+             *
+             * `color_scheme_reversed` needs no equivalent: it *is* part of the
+             * updateColorScheme seam, so the engine mirrors it on its own.
+             */
+            await invoke('update_simulation_state', {
+                stateName: 'current_color_scheme',
+                value: name,
+            });
             const synced = await syncManager.syncAll();
             if (synced.settings) settings = synced.settings;
             if (synced.state) state = synced.state;
@@ -917,9 +891,6 @@
         });
         eventListeners.add();
 
-        // Load available webcams once UI mounts
-        loadGrayScottWebcams();
-
         // Listen for simulation initialization event
         listen('simulation-initialized', async () => {
             console.log('Simulation initialized, syncing settings...');
@@ -927,17 +898,6 @@
             await getPresets();
             await getColorSchemes();
             await syncSettingsFromBackend();
-
-            // Fetch initial camera state to get correct viewport dimensions
-            await fetchCameraState();
-
-            // Initialize cursor position to center of screen so golden crosshair is visible
-            const centerX = window.innerWidth / 2;
-            const centerY = window.innerHeight / 2;
-            const devicePixelRatio = window.devicePixelRatio || 1;
-            const physicalCenterX = centerX * devicePixelRatio;
-            const physicalCenterY = centerY * devicePixelRatio;
-            sendCursorToBackend(physicalCenterX, physicalCenterY);
 
             // Seed random noise to start with interesting patterns
             try {

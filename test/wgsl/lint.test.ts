@@ -40,21 +40,19 @@ const SINGLE_INVOCATION_SHADERS = new Set([
  * too. The ledger empties as the port progresses.
  */
 const KNOWN_VIOLATIONS = {
-    // Remediation (a), (b), (c) — M12 Flow; (d) — M4 Gray-Scott.
+    // Remediation (a), (b), (c) — M12 Flow. (d) is fixed: gray_scott/paint.wgsl
+    // ping-pongs, with copy-through at its early-outs.
     readWriteStorageTexture: [
         'src-tauri/src/simulations/flow/shaders/particle_update.wgsl:58',
         'src-tauri/src/simulations/flow/shaders/shape_drawing.wgsl:19',
         'src-tauri/src/simulations/flow/shaders/trail_decay_diffusion.wgsl:46',
-        'src-tauri/src/simulations/gray_scott/shaders/paint.wgsl:16',
     ],
     // Remediation (e) — M10 Pellets.
     atomicInReadStorage: [
         'src-tauri/src/simulations/pellets/shaders/physics_compute.wgsl:65',
     ],
-    // Remediation (f) — M4 Gray-Scott.
-    singleInvocationWorkgroup: [
-        'src-tauri/src/simulations/gray_scott/shaders/reaction_diffusion.wgsl:261',
-    ],
+    // Remediation (f) is fixed: gray_scott/reaction_diffusion.wgsl is 8x8x1.
+    singleInvocationWorkgroup: [],
 };
 
 /** Reduces "path:line  match" down to "path:line" for ledger comparison. */
@@ -144,8 +142,8 @@ describe('WGSL corpus', () => {
 
     /**
      * A 1x1x1 workgroup dispatched once per pixel wastes ~63/64 of every GPU
-     * wave. Legal, but a severe perf bug — gray_scott dispatches 2,073,600
-     * workgroups at 1080p where 32,400 would do.
+     * wave. Legal, but a severe perf bug — gray_scott dispatched 2,073,600
+     * workgroups at 1080p where 32,400 would do, until it was raised to 8x8x1.
      */
     it('has no 1x1x1 workgroup size', () => {
         const violations: string[] = [];

@@ -1300,7 +1300,9 @@ impl GrayScottModel {
                     .get_bind_group(&self.bind_groups[0], &self.bind_groups[1]),
                 &[],
             );
-            compute_pass.dispatch_workgroups(self.width, self.height, 1);
+            // reaction_diffusion.wgsl declares @workgroup_size(8, 8, 1); the ragged
+            // tail is discarded by the bounds guard at reaction_diffusion.wgsl:266.
+            compute_pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
         }
 
         queue.submit(std::iter::once(encoder.finish()));
@@ -1483,11 +1485,14 @@ impl GrayScottModel {
             return Ok(()); // Outside simulation bounds
         }
 
-        // Use GPU-based painting
+        // Use GPU-based painting. Painting is a ping-pong pass now, not an in-place
+        // one (paint.wgsl:16-22), so it reads the current texture and writes the
+        // inactive one — which then has to become current.
         self.paint_compute.paint(
             device,
             queue,
-            self.simulation_textures.current_texture(),
+            self.simulation_textures.current_view(),
+            self.simulation_textures.inactive_view(),
             texture_x,
             texture_y,
             self.state.cursor_size,
@@ -1496,6 +1501,7 @@ impl GrayScottModel {
             self.width,
             self.height,
         )?;
+        self.simulation_textures.swap();
 
         Ok(())
     }

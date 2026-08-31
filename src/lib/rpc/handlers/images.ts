@@ -20,6 +20,11 @@ import { getEngineContext, hasEngineContext } from '../context';
 /** The `slot` each command names, for simulations with more than one input. */
 const IMAGE_COMMANDS: Record<string, string> = {
     load_moire_image: 'image',
+    // Gray-Scott's mask image. Registered in M4: before that the name fell
+    // through to the registry stub, which resolves `null`, so picking a file
+    // in the "Image" mask pattern did nothing at all and said nothing about it.
+    // Gray-Scott has exactly one image input, so the slot is informational.
+    load_gray_scott_nutrient_image: 'nutrient',
 };
 
 /**

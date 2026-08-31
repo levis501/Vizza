@@ -258,7 +258,7 @@ fn calculate_adaptive_timestep(delta_u: f32, delta_v: f32, feed_rate: f32, kill_
 
 
 
-@compute @workgroup_size(1, 1, 1)
+@compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let x = i32(global_id.x);
     let y = i32(global_id.y);

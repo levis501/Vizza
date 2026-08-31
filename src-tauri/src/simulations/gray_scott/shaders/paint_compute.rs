@@ -20,10 +20,18 @@ impl PaintCompute {
             label: Some("Paint Bind Group Layout"),
             entries: &[
                 resource_helpers::uniform_buffer_entry(0, wgpu::ShaderStages::COMPUTE),
-                resource_helpers::storage_texture_entry(
+                // Ping-pong, matching paint.wgsl:21-22: source sampled, destination
+                // write-only. rgba16float cannot be a read_write storage texture.
+                resource_helpers::texture_entry(
                     1,
                     wgpu::ShaderStages::COMPUTE,
-                    wgpu::StorageTextureAccess::ReadWrite,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                    wgpu::TextureViewDimension::D2,
+                ),
+                resource_helpers::storage_texture_entry(
+                    2,
+                    wgpu::ShaderStages::COMPUTE,
+                    wgpu::StorageTextureAccess::WriteOnly,
                     wgpu::TextureFormat::Rgba16Float,
                 ),
             ],
@@ -50,11 +58,16 @@ impl PaintCompute {
         }
     }
 
+    /// Paints into `dst_view` from `src_view`. The caller owns the ping-pong and
+    /// must swap after this returns — every texel of the destination is written,
+    /// including the ones the brush does not touch (paint.wgsl copies those through).
+    #[allow(clippy::too_many_arguments)]
     pub fn paint(
         &self,
         device: &Arc<Device>,
         queue: &Arc<Queue>,
-        texture: &wgpu::Texture,
+        src_view: &wgpu::TextureView,
+        dst_view: &wgpu::TextureView,
         mouse_x: f32,
         mouse_y: f32,
         cursor_size: f32,
@@ -85,13 +98,13 @@ impl PaintCompute {
         queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&[paint_params]));
 
         // Create bind group
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Paint Bind Group"),
             layout: &self.bind_group_layout,
             entries: &[
                 resource_helpers::buffer_entry(0, &params_buffer),
-                resource_helpers::texture_view_entry(1, &texture_view),
+                resource_helpers::texture_view_entry(1, src_view),
+                resource_helpers::texture_view_entry(2, dst_view),
             ],
         });
 
