@@ -68,6 +68,14 @@ Moiré patterns with distortion effects.
 
 ![Moiré Example](example-moire.png)
 
+## Wiki
+
+The [wiki](wiki/) explains what the simulations are actually doing — what the
+settings mean in terms of what you see on screen, and which ones are worth
+reaching for. Start with
+[Pheromone Deposition](wiki/slime-mold/pheromone-deposition.md) if you have
+Slime Mold open.
+
 ## For Developers
 
 ### Prerequisites
