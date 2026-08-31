@@ -555,9 +555,7 @@ Learn the grid_clear/grid_populate pattern here — 40% less shader code than Pe
 - [ ] Wire up the unused `UiHiddenIndicator.svelte` (273 ln, imported by nothing today)
 - [ ] **Redesign `Selector.svelte` — the named-option cycler.** Reported from the M6 browser check: the control leaves **less than one character's width** for the option name, so a colour space, a display mode or an interpolation mode is effectively unreadable. **This is general, not gradient-specific** — it applies to every "cycle through named options" control in the app. Scope measured: one component, `src/lib/components/inputs/Selector.svelte`, with **44 instances across 14 files** — `ColorSchemeSelector.svelte` (8), `GradientEditorMode.svelte` (8), `VectorsMode.svelte` (5), `FlowMode.svelte` (5), then the rest. One component change plus a sweep, not a per-mode fix.
 
-  Two directions were offered and **neither was chosen** — both are live:
-  - **(a)** Drop the ◀/▶ arrows, use a plain text dropdown.
-  - **(b)** Keep the arrows, drop the dropdown, and show the selected name as an **overlay over the render surface** — where the effect is actually happening and the user is already looking — freeing the control strip entirely. The more interesting option, but it needs a decision about controls whose effect is *not* visible on the canvas, which is most of the 44.
+  **Decided: drop the ◀/▶ arrows and keep a plain text dropdown.** The alternative considered was keeping the arrows and moving the option name to an overlay over the render surface; rejected as the harder option, and it would not have suited most of the 44 sites anyway — mask target, fit mode and field type have no directly visible effect on the canvas to overlay onto. Removing the arrows recovers their width for the name, which is the whole problem.
 
   **Do this in M13, not M14.** M14's job is visual parity against the 7 reference screenshots; redesigning `Selector` inside that milestone would invalidate the parity work as it is being done. Landing it here means M14 compares the final UI.
 - [ ] **Test:** old-schema preset loads after a field is added; export→import lossless
