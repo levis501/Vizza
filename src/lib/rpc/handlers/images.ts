@@ -25,6 +25,11 @@ const IMAGE_COMMANDS: Record<string, string> = {
     // in the "Image" mask pattern did nothing at all and said nothing about it.
     // Gray-Scott has exactly one image input, so the slot is informational.
     load_gray_scott_nutrient_image: 'nutrient',
+    // Vectors' image-driven field, registered in M5 — image path #2 for the
+    // port. Same story as Gray-Scott's above: until now it fell through to the
+    // registry stub, so choosing a file in the "Image" vector-field type
+    // resolved `null` and left the field on its neutral 0.5 constant.
+    load_vectors_vector_field_image: 'vector_field',
 };
 
 /**

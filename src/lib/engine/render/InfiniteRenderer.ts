@@ -2,10 +2,14 @@
  * The tiled infinite canvas — a wrapper around
  * `src-tauri/src/simulations/shared/infinite_render.wgsl` (306 ln).
  *
- * Six simulations draw through this shader (Flow, Gray-Scott, Moiré, Pellets,
- * Slime Mold, Vectors), each with its own near-identical copy of the pipeline,
- * layout and bind-group boilerplate in Rust. It lives in `engine/` rather than
- * in any one sim so the next five milestones inherit it instead of repeating it.
+ * Five simulations draw through this shader (Flow, Gray-Scott, Moiré, Pellets,
+ * Slime Mold), each with its own near-identical copy of the pipeline, layout and
+ * bind-group boilerplate in Rust. It lives in `engine/` rather than in any one
+ * sim so the remaining milestones inherit it instead of repeating it.
+ *
+ * Vectors was listed here until M5 and does not belong: `vectors/simulation.rs`
+ * renders straight to the surface with a clear colour, no tiling and no infinite
+ * canvas at all.
  *
  * How it works: one unit quad is instanced `tileCount²` times, each instance
  * offset by two world units, so the simulation texture repeats forever in every

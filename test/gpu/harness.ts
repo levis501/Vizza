@@ -22,7 +22,12 @@ import {
 } from '$lib/engine/resources/textures';
 import { PingPongTextures } from '$lib/engine/resources/pingPong';
 import { BindGroupLayoutCache } from '$lib/engine/resources/bindGroupCache';
-import { readBuffer, createStorageBuffer, align } from '$lib/engine/resources/buffers';
+import {
+    readBuffer,
+    createStorageBuffer,
+    createUniformBuffer,
+    align,
+} from '$lib/engine/resources/buffers';
 import { AverageColor } from '$lib/engine/postprocess/averageColor';
 import { PostProcessing, defaultPostProcessingState } from '$lib/engine/postprocess/PostProcessing';
 import { MainMenuSimulation, defaultLut, reverseLut } from '$lib/engine/sims/mainMenu';
@@ -39,6 +44,21 @@ import {
     defaultGrayScottState,
     type GrayScottSettings,
 } from '$lib/engine/sims/grayScott/settings';
+import {
+    VectorsSimulation,
+    VECTORS_LINE_SHADER_PATH,
+    vectorsGridPointAt,
+    vectorsVertexShaderSource,
+} from '$lib/engine/sims/vectors';
+import {
+    defaultVectorsSettings,
+    vectorsGridExtent,
+    vectorsLineQuad,
+    vectorsLineSegment,
+    vectorsQuadIndices,
+    VECTORS_MAX_LINES,
+} from '$lib/engine/sims/vectors/settings';
+import { Camera } from '$lib/engine/core/Camera';
 import { calculateTileCount, TEXTURE_FILTERING } from '$lib/engine/render/InfiniteRenderer';
 import { ResourceLedger, instrumentDevice } from '$lib/engine/core/resourceLedger';
 import type { GpuContext } from '$lib/engine/types';
@@ -265,6 +285,36 @@ const KNOWN_COMPILE_FAILURES = new Set([
     'pellets/shaders/physics_compute.wgsl',
 ]);
 
+/**
+ * Shaders that are *consumers of a function library* rather than standalone
+ * modules, mapped to the library they are concatenated behind.
+ *
+ * `vectors/shaders/noise.wgsl` declares no bindings and no entry point precisely
+ * so it can be prepended to a consumer's source, which is how M5 gets an include
+ * mechanism the corpus does not have. Compiled on its own a consumer is an
+ * unresolved `noise_sample` — a property of the arrangement, not a defect — so
+ * they are compiled here exactly as `vectorsVertexShaderSource()` compiles them.
+ *
+ * Asserted in both directions below: a listed shader that compiles alone no
+ * longer needs the entry, and an entry whose concatenation fails is a real
+ * error.
+ */
+const CONCATENATED_SHADERS = new Map<string, string>([
+    ['vectors/shaders/line_instanced.wgsl', 'vectors/shaders/noise.wgsl'],
+]);
+
+/** The source the app actually hands `createShaderModule` for this path. */
+function moduleSourceFor(path: string): string {
+    const library = CONCATENATED_SHADERS.get(path);
+    return library ? `${getShader(library)}\n${getShader(path)}` : getShader(path);
+}
+
+async function compileErrors(label: string, code: string): Promise<GPUCompilationMessage[]> {
+    const module = gpu.device.createShaderModule({ label, code });
+    const info = await module.getCompilationInfo();
+    return info.messages.filter((message) => message.type === 'error');
+}
+
 test('all WGSL modules compile with zero errors', async () => {
     const paths = shaderPathsNow();
     assert(paths.length >= 60, `expected the full corpus, found only ${paths.length} shaders`);
@@ -273,7 +323,7 @@ test('all WGSL modules compile with zero errors', async () => {
     const failedPaths = new Set<string>();
 
     for (const path of paths) {
-        const module = gpu.device.createShaderModule({ label: path, code: getShader(path) });
+        const module = gpu.device.createShaderModule({ label: path, code: moduleSourceFor(path) });
         const info = await module.getCompilationInfo();
         for (const message of info.messages) {
             if (message.type !== 'error') continue;
@@ -293,6 +343,23 @@ test('all WGSL modules compile with zero errors', async () => {
         fixed.length === 0,
         `these shaders now compile — remove them from KNOWN_COMPILE_FAILURES: ${fixed.join(', ')}`
     );
+});
+
+test('the concatenated shaders need their library, and only their library', async () => {
+    for (const [path, library] of CONCATENATED_SHADERS) {
+        const alone = await compileErrors(`${path} (alone)`, getShader(path));
+        assert(
+            alone.length > 0,
+            `${path} compiles on its own — it no longer needs ${library} prepended, ` +
+                `so remove it from CONCATENATED_SHADERS`
+        );
+
+        const library_alone = await compileErrors(`${library} (alone)`, getShader(library));
+        assert(
+            library_alone.length === 0,
+            `${library} must stay a self-contained function library: ${library_alone[0]?.message}`
+        );
+    }
 });
 
 test('createShaderModuleChecked throws on bad WGSL', async () => {
@@ -1680,6 +1747,928 @@ test('gray-scott create/destroy x20 leaves the resource ledger clean', async () 
     const probe = createStorageBuffer(gpu.device, 256, { label: 'post-gray-scott probe' });
     const error = await gpu.device.popErrorScope();
     assert(error === null, `device unhealthy after 20 gray-scott cycles: ${error?.message}`);
+    probe.destroy();
+    churnTarget.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// Vectors — the WGSL noise library — M5
+// ---------------------------------------------------------------------------
+
+/**
+ * `vectors/shaders/noise.wgsl` is a function library: no bindings, no entry
+ * point, meant to be concatenated ahead of a consuming shader. This driver is
+ * that consumer, which means these tests exercise the concatenation contract as
+ * well as the maths — a stray binding or entry point in the library would show
+ * up here as a duplicate-declaration compile error.
+ */
+const NOISE_SHADER_PATH = 'vectors/shaders/noise.wgsl';
+
+const NOISE_PROBE_DRIVER = `
+struct NoiseProbeParams {
+    noise_type: u32,
+    seed: u32,
+    width: u32,
+    height: u32,
+    origin_x: f32,
+    origin_y: f32,
+    step: f32,
+    z: f32,
+}
+
+@group(0) @binding(0) var<uniform> probe: NoiseProbeParams;
+@group(0) @binding(1) var<storage, read_write> samples: array<f32>;
+
+@compute @workgroup_size(8, 8, 1)
+fn probe_noise(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= probe.width || gid.y >= probe.height) {
+        return;
+    }
+    // Matches the Rust sampling geometry: x and y are scaled world position,
+    // z is animated time (vectors/simulation.rs:304-306).
+    let p = vec3<f32>(
+        probe.origin_x + f32(gid.x) * probe.step,
+        probe.origin_y + f32(gid.y) * probe.step,
+        probe.z
+    );
+    samples[gid.y * probe.width + gid.x] = noise_sample(probe.noise_type, p, probe.seed);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn probe_noise_signed(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= probe.width || gid.y >= probe.height) {
+        return;
+    }
+    let p = vec3<f32>(
+        probe.origin_x + f32(gid.x) * probe.step,
+        probe.origin_y + f32(gid.y) * probe.step,
+        probe.z
+    );
+    samples[gid.y * probe.width + gid.x] = noise_sample_signed(probe.noise_type, p, probe.seed);
+}
+`;
+
+interface NoiseProbeOptions {
+    /** Grid side; the field is square. */
+    size?: number;
+    /** World distance between adjacent samples. */
+    step?: number;
+    /** Lower-left corner, offset from the origin so no type is sampled only on its lattice. */
+    origin?: number;
+    /** The animated third coordinate. */
+    z?: number;
+    /** Sample the raw [-1,1] value instead of the normalised, clamped one. */
+    signed?: boolean;
+}
+
+const noiseProbePipelines = new Map<string, GPUComputePipeline>();
+let noiseProbeModule: GPUShaderModule | null = null;
+
+async function noisePipeline(entryPoint: string): Promise<GPUComputePipeline> {
+    const cached = noiseProbePipelines.get(entryPoint);
+    if (cached) return cached;
+
+    if (!noiseProbeModule) {
+        noiseProbeModule = await createShaderModuleChecked(gpu.device, {
+            label: 'vectors noise probe',
+            code: `${getShader(NOISE_SHADER_PATH)}\n${NOISE_PROBE_DRIVER}`,
+        });
+    }
+    const pipeline = gpu.device.createComputePipeline({
+        label: `vectors noise probe (${entryPoint})`,
+        layout: 'auto',
+        compute: { module: noiseProbeModule, entryPoint },
+    });
+    noiseProbePipelines.set(entryPoint, pipeline);
+    return pipeline;
+}
+
+async function sampleNoise(
+    noiseType: number,
+    seed: number,
+    options: NoiseProbeOptions = {}
+): Promise<Float32Array> {
+    const size = options.size ?? 48;
+    const step = options.step ?? 0.17;
+    const origin = options.origin ?? -3.31;
+    const z = options.z ?? 0.37;
+
+    const pipeline = await noisePipeline(options.signed ? 'probe_noise_signed' : 'probe_noise');
+    const params = createUniformBuffer(gpu.device, 32, { label: 'noise probe params' });
+    const output = createStorageBuffer(gpu.device, size * size * 4, { label: 'noise probe out' });
+
+    const bytes = new ArrayBuffer(32);
+    new Uint32Array(bytes, 0, 4).set([noiseType, seed, size, size]);
+    new Float32Array(bytes, 16, 4).set([origin, origin, step, z]);
+    gpu.device.queue.writeBuffer(params, 0, bytes);
+
+    const bindGroup = gpu.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: params } },
+            { binding: 1, resource: { buffer: output } },
+        ],
+    });
+
+    const encoder = gpu.device.createCommandEncoder({ label: 'noise probe' });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    const groups = Math.ceil(size / 8);
+    pass.dispatchWorkgroups(groups, groups, 1);
+    pass.end();
+    gpu.device.queue.submit([encoder.finish()]);
+
+    const raw = await readBuffer(gpu.device, output, size * size * 4);
+    params.destroy();
+    output.destroy();
+
+    return new Float32Array(raw, 0, size * size);
+}
+
+/** Width of the middle 90% of the samples — how much of [0,1] the field really uses. */
+function centralSpread(values: Float32Array): number {
+    const sorted = Float32Array.from(values).sort();
+    const low = sorted[Math.floor(sorted.length * 0.05)];
+    const high = sorted[Math.ceil(sorted.length * 0.95) - 1];
+    return high - low;
+}
+
+function meanAbsDelta(a: Float32Array, b: Float32Array): number {
+    let total = 0;
+    for (let i = 0; i < a.length; i++) total += Math.abs(a[i] - b[i]);
+    return total / a.length;
+}
+
+/** Mean |difference| between horizontally adjacent samples. */
+function meanNeighbourDelta(values: Float32Array, size: number): number {
+    let total = 0;
+    let count = 0;
+    for (let y = 0; y < size; y++) {
+        for (let x = 0; x + 1 < size; x++) {
+            total += Math.abs(values[y * size + x + 1] - values[y * size + x]);
+            count++;
+        }
+    }
+    return total / count;
+}
+
+/** Mean |difference| between samples half a grid apart — the decorrelated baseline. */
+function meanDistantDelta(values: Float32Array, size: number): number {
+    const span = Math.floor(size / 2);
+    let total = 0;
+    let count = 0;
+    for (let y = 0; y < size; y++) {
+        for (let x = 0; x + span < size; x++) {
+            total += Math.abs(values[y * size + x + span] - values[y * size + x]);
+            count++;
+        }
+    }
+    return total / count;
+}
+
+/**
+ * The eleven types of `NoiseType` (vectors/settings.rs:65), in declaration
+ * order, which is the code `noise_sample` switches on.
+ *
+ * `seeded` records a real asymmetry rather than an oversight: Cylinders and
+ * Checkerboard are analytic functions of position, and the crate's own
+ * constructors take no seed for them (noise_helper.rs:47-48), so changing the
+ * seed must leave those two fields bit-identical. `continuous` excludes
+ * Checkerboard alone, which is a step function by definition.
+ */
+const NOISE_TYPES: ReadonlyArray<{
+    code: number;
+    name: string;
+    seeded: boolean;
+    continuous: boolean;
+}> = [
+    { code: 0, name: 'OpenSimplex', seeded: true, continuous: true },
+    { code: 1, name: 'Worley', seeded: true, continuous: true },
+    { code: 2, name: 'Value', seeded: true, continuous: true },
+    { code: 3, name: 'Fbm', seeded: true, continuous: true },
+    { code: 4, name: 'FBMBillow', seeded: true, continuous: true },
+    { code: 5, name: 'FBMClouds', seeded: true, continuous: true },
+    { code: 6, name: 'FBMRidged', seeded: true, continuous: true },
+    { code: 7, name: 'Billow', seeded: true, continuous: true },
+    { code: 8, name: 'RidgedMulti', seeded: true, continuous: true },
+    { code: 9, name: 'Cylinders', seeded: false, continuous: true },
+    { code: 10, name: 'Checkerboard', seeded: false, continuous: false },
+];
+
+/**
+ * A field that occupies only a sliver of [0, 1] is a real defect even though
+ * every sample is "valid": `simulation.rs:312` turns the value straight into an
+ * angle of `value * 2pi`, so the middle 90% of the field spanning less than
+ * 0.15 means nine tenths of the lines lie within 54 degrees of each other and
+ * the result reads as a comb rather than a flow. Ridged and billow types are
+ * asymmetric by construction and sit lowest against this bar, which is why the
+ * threshold is set by what a viewer would notice rather than by a distribution.
+ */
+const MIN_CENTRAL_SPREAD = 0.15;
+
+/**
+ * Two seeds are uncorrelated when the mean |difference| approaches that of two
+ * independent draws from the same distribution. A tenth of the range is far
+ * above what a shared-structure bug (seed folded in after the lattice hash,
+ * say) would produce, and far below the ~0.2-0.35 the real fields show.
+ */
+const MIN_SEED_DIVERGENCE = 0.05;
+
+/**
+ * Step for the smoothness check: a fiftieth of a lattice cell, so that even a
+ * ten-octave fractal is sampled well inside its finest feature.
+ */
+const NOISE_FINE_STEP = 0.02;
+
+/**
+ * Adjacent samples must differ by less than this fraction of what samples half
+ * a grid apart differ by. A per-point hash scores ~1.0 — its neighbours are as
+ * unrelated as its distant samples — while the measured fields score 0.02
+ * (Value) to 0.15 (Billow, whose eight octaves really are near-decorrelated at
+ * their top frequency whatever the step). A third leaves that worst case a 2.1x
+ * margin and still fails a hash by a factor of three.
+ */
+const MAX_SMOOTHNESS_RATIO = 0.33;
+
+for (const { code, name, seeded, continuous } of NOISE_TYPES) {
+    test(`noise ${name} is finite, in range, varied and deterministic`, async () => {
+        const size = 48;
+        const field = await sampleNoise(code, 1234, { size });
+
+        assert(field.length === size * size, `expected ${size * size} samples`);
+        assert(!hasNonFinite(field), `${name} produced a NaN or Infinity`);
+
+        let min = Infinity;
+        let max = -Infinity;
+        for (const v of field) {
+            min = Math.min(min, v);
+            max = Math.max(max, v);
+        }
+        assert(min >= 0 && max <= 1, `${name} left [0,1]: min ${min}, max ${max}`);
+        assert(max - min > 1e-6, `${name} is constant at ${min} — the classic mis-seeded hash`);
+
+        const spread = centralSpread(field);
+        assert(
+            spread >= MIN_CENTRAL_SPREAD,
+            `${name} uses only ${spread.toFixed(3)} of [0,1] in its middle 90% ` +
+                `(min ${MIN_CENTRAL_SPREAD}) — a visually flat field`
+        );
+
+        // Determinism: the same inputs, a second dispatch, byte for byte. An
+        // integer hash guarantees this; a sin()-based one would not across
+        // drivers, which is why the library uses the former.
+        const again = await sampleNoise(code, 1234, { size });
+        assert(meanAbsDelta(field, again) === 0, `${name} is not deterministic`);
+
+        const otherSeed = await sampleNoise(code, 98765, { size });
+        const divergence = meanAbsDelta(field, otherSeed);
+        if (seeded) {
+            assert(
+                divergence >= MIN_SEED_DIVERGENCE,
+                `${name} barely responded to a new seed: mean |delta| ${divergence.toFixed(4)}`
+            );
+        } else {
+            assert(
+                divergence === 0,
+                `${name} takes no seed in the Rust (noise_helper.rs:47-48) and must ignore it here, ` +
+                    `but the field moved by ${divergence.toFixed(4)}`
+            );
+        }
+
+        if (continuous) {
+            // The assertion that separates noise from a plain hash: everything
+            // above passes for a per-sample random number. Only a field with
+            // spatial structure has neighbours that agree.
+            //
+            // Sampled on its own fine grid rather than reusing the field above,
+            // because "adjacent" has to mean adjacent relative to the *finest*
+            // feature: at the 0.17 step above, a 10-octave fractal's top octave
+            // is already decorrelated between neighbours, and Cylinders has
+            // covered a third of a period, so both look hash-like on a measure
+            // that is really about scale.
+            const fine = await sampleNoise(code, 1234, { size, step: NOISE_FINE_STEP });
+            const near = meanNeighbourDelta(fine, size);
+            const far = meanDistantDelta(fine, size);
+            assert(
+                near < far * MAX_SMOOTHNESS_RATIO,
+                `${name} is not smooth: adjacent samples differ by ${near.toFixed(4)}, ` +
+                    `distant ones by ${far.toFixed(4)} — this looks like a hash, not noise`
+            );
+        }
+    });
+}
+
+test('noise fields are smooth under refinement, not merely correlated', async () => {
+    // Halving the step must roughly halve the neighbour difference for
+    // gradient-based types. A lattice bug that snaps to integer cells would
+    // hold the difference flat instead.
+    for (const code of [0, 2, 3, 5]) {
+        const coarse = await sampleNoise(code, 77, { size: 32, step: 0.2 });
+        const fine = await sampleNoise(code, 77, { size: 32, step: 0.05 });
+
+        const coarseDelta = meanNeighbourDelta(coarse, 32);
+        const fineDelta = meanNeighbourDelta(fine, 32);
+        assert(
+            fineDelta < coarseDelta * 0.6,
+            `type ${code}: refining the step 4x changed the neighbour difference from ` +
+                `${coarseDelta.toFixed(4)} to ${fineDelta.toFixed(4)} — not a continuous field`
+        );
+    }
+});
+
+test('the noise field advances with the animated third coordinate', async () => {
+    // z is time in the Vectors sim, so a field that ignores it would animate
+    // nothing while still passing every static assertion above.
+    for (const { code, name } of NOISE_TYPES) {
+        const t0 = await sampleNoise(code, 4242, { size: 32, z: 0.13 });
+        const t1 = await sampleNoise(code, 4242, { size: 32, z: 1.63 });
+        assert(
+            meanAbsDelta(t0, t1) > 1e-4,
+            `${name} does not vary with z, so the simulation would be frozen`
+        );
+    }
+});
+
+/**
+ * The header of `noise.wgsl` tabulates each type's range *before*
+ * normalisation, and that table is the only record of which types the [0,1]
+ * clamp actually touches. Pinning it here means a rescaled generator — someone
+ * changing the simplex falloff constant, or swapping fBm's normalisation —
+ * fails a test instead of silently making the documentation wrong.
+ */
+test('the signed noise range matches what the library documents', async () => {
+    // Only the two plain-fBm types exceed +/-1, and only in the tail: octaves
+    // are normalised by the root of their summed squares, which preserves the
+    // base noise's spread at the price of a tail that occasionally lands
+    // outside. Everything else is bounded by construction.
+    const bounds = new Map<number, { limit: number; maxClipped: number }>([
+        [3, { limit: 1.35, maxClipped: 0.02 }], // Fbm
+        [5, { limit: 1.35, maxClipped: 0.02 }], // FBMClouds
+    ]);
+
+    for (const { code, name } of NOISE_TYPES) {
+        const { limit, maxClipped } = bounds.get(code) ?? { limit: 1.001, maxClipped: 0 };
+        const signed = await sampleNoise(code, 1234, { size: 64, signed: true });
+
+        assert(!hasNonFinite(signed), `${name} produced a non-finite signed sample`);
+
+        let extreme = 0;
+        let clipped = 0;
+        for (const v of signed) {
+            extreme = Math.max(extreme, Math.abs(v));
+            if (v < -1 || v > 1) clipped++;
+        }
+        assert(
+            extreme <= limit,
+            `${name} reached ${extreme.toFixed(3)}, past the documented bound of ${limit}`
+        );
+        const fraction = clipped / signed.length;
+        assert(
+            fraction <= maxClipped,
+            `${name} needed the [0,1] clamp on ${(fraction * 100).toFixed(2)}% of samples, ` +
+                `over the documented ${(maxClipped * 100).toFixed(0)}%`
+        );
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Vectors — the simulation — M5
+// ---------------------------------------------------------------------------
+
+/**
+ * Settings that make a line field visible in a 64-pixel test target.
+ *
+ * `Settings::default()` is `line_width: 0.001`, `line_length: 0.03` — a line
+ * ~0.03 px wide and ~1 px long here, i.e. no coverage at all and a black image
+ * that would pass "is it finite" and nothing else. On the real 1920-px surface
+ * those same numbers are a ~1 px line, which is the point of them. So the tests
+ * scale the *geometry*, never the field: density, noise type, seed and the
+ * sampling are left exactly as they ship.
+ */
+function visibleVectorsSettings(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+        ...defaultVectorsSettings(),
+        density: 0.1, // 25 x 25 lines across the padded view
+        line_length: 0.2,
+        line_width: 0.05,
+        ...overrides,
+    };
+}
+
+/** The camera a simulation constructed for itself, which is the one it drives. */
+function simCamera(sim: VectorsSimulation): Camera {
+    return (sim as unknown as { camera: Camera }).camera;
+}
+
+/**
+ * The CPU/GPU mirror probe.
+ *
+ * Concatenated behind the *shipping* vertex source — noise library included —
+ * so it calls the very functions `vs_main` calls. Bindings are in group 1
+ * because group 0 belongs to the render pipeline; a compute entry that uses
+ * neither is given an empty layout for group 0 by `layout: 'auto'`.
+ *
+ * `value` is synthesised from the instance index rather than sampled, because
+ * what is under test here is the geometry — grid point, segment, quad corner,
+ * corner order — and mixing the noise in would make a failure ambiguous.
+ */
+const VECTORS_MIRROR_DRIVER = `
+struct MirrorProbe {
+    grid_min: vec2<f32>,
+    spacing: f32,
+    count_y: u32,
+    line_length: f32,
+    line_width: f32,
+    instances: u32,
+    _pad: u32,
+}
+
+@group(1) @binding(0) var<uniform> mirror: MirrorProbe;
+@group(1) @binding(1) var<storage, read_write> mirror_out: array<f32>;
+
+@compute @workgroup_size(64, 1, 1)
+fn probe_mirror(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let instance = gid.x;
+    if (instance >= mirror.instances) {
+        return;
+    }
+
+    let p0 = vectors_grid_point(mirror.grid_min, mirror.spacing, mirror.count_y, instance);
+    let value = f32(instance) / f32(mirror.instances);
+    let p1 = vectors_line_end(p0, value, mirror.line_length);
+
+    let base = instance * 16u;
+    mirror_out[base] = p0.x;
+    mirror_out[base + 1u] = p0.y;
+    mirror_out[base + 2u] = p1.x;
+    mirror_out[base + 3u] = p1.y;
+
+    for (var v = 0u; v < 6u; v++) {
+        let corner = vectors_quad_corner(p0, p1, mirror.line_width, vectors_corner_index(v));
+        mirror_out[base + 4u + v * 2u] = corner.x;
+        mirror_out[base + 5u + v * 2u] = corner.y;
+    }
+}
+`;
+
+/** 2 for p0, 2 for p1, then the six quad vertices. */
+const MIRROR_FLOATS_PER_INSTANCE = 16;
+
+test('the vectors shader mirrors the grid arithmetic settings.ts declares', () => {
+    // The text pin, in the spirit of the `calculate_tile_count` test in
+    // test/unit/moire.test.ts: the CPU issues the draw and the GPU places the
+    // geometry, so a silent divergence tears the field with nothing to see.
+    const wgsl = getShader(VECTORS_LINE_SHADER_PATH);
+
+    const gridPoint = wgsl.slice(wgsl.indexOf('fn vectors_grid_point'));
+    assert(gridPoint.includes('let ix = instance / count_y;'), 'grid x index changed');
+    assert(gridPoint.includes('let iy = instance % count_y;'), 'grid y index changed');
+    assert(
+        gridPoint.includes('return grid_min + vec2<f32>(f32(ix), f32(iy)) * spacing;'),
+        'grid point arithmetic no longer matches vectorsGridPointAt'
+    );
+
+    // `vectorsLineSegment`: angle is the full turn, length runs from half.
+    const lineEnd = wgsl.slice(wgsl.indexOf('fn vectors_line_end'));
+    assert(lineEnd.includes('let angle = value * VECTORS_TAU;'), 'angle is no longer value * TAU');
+    assert(
+        lineEnd.includes('let len = line_length * (0.5 + value * 0.5);'),
+        'segment length no longer matches vectorsLineSegment'
+    );
+    assert(
+        wgsl.includes('const VECTORS_TAU: f32 = 6.2831853071795864769;'),
+        'TAU changed, so every line angle changed with it'
+    );
+
+    // `vectorsLineQuad`: the normal, half the width each side, and the 1e-6
+    // guard for a zero-length segment.
+    const quadCorner = wgsl.slice(wgsl.indexOf('fn vectors_quad_corner'));
+    assert(quadCorner.includes('let len = max(length(d), 1e-6);'), 'zero-length guard changed');
+    assert(
+        quadCorner.includes('let normal = vec2<f32>(-d.y, d.x) / len * (line_width * 0.5);'),
+        'quad normal no longer matches vectorsLineQuad'
+    );
+
+    // `vectorsQuadIndices(0)` is [0, 1, 2, 0, 2, 3].
+    const cornerIndex = wgsl.slice(wgsl.indexOf('fn vectors_corner_index'));
+    assert(cornerIndex.includes('case 0u, 3u:'), 'quad triangle order changed');
+    assert(cornerIndex.includes('case 2u, 4u:'), 'quad triangle order changed');
+    assert(
+        JSON.stringify(vectorsQuadIndices(0)) === JSON.stringify([0, 1, 2, 0, 2, 3]),
+        'vectorsQuadIndices changed; the shader still hardcodes [0,1,2,0,2,3]'
+    );
+});
+
+test('vectors grid geometry agrees between the CPU and the GPU', async () => {
+    // A camera and density that exercise a non-square offset and a fractional
+    // spacing, not the origin.
+    const extent = vectorsGridExtent(0.37, -1.21, 1.6, 0.09);
+    const instances = 96;
+    assert(extent.count > instances, 'the probe must stay inside the real grid');
+
+    const module = await createShaderModuleChecked(gpu.device, {
+        label: 'vectors mirror probe',
+        code: `${vectorsVertexShaderSource()}\n${VECTORS_MIRROR_DRIVER}`,
+    });
+    const pipeline = gpu.device.createComputePipeline({
+        label: 'vectors mirror probe pipeline',
+        layout: 'auto',
+        compute: { module, entryPoint: 'probe_mirror' },
+    });
+
+    const lineLength = 0.03;
+    const lineWidth = 0.011;
+
+    const params = createUniformBuffer(gpu.device, 32, { label: 'mirror probe params' });
+    const bytes = new ArrayBuffer(32);
+    new Float32Array(bytes, 0, 3).set([extent.minX, extent.minY, extent.spacing]);
+    new Uint32Array(bytes, 12, 1).set([extent.countY]);
+    new Float32Array(bytes, 16, 2).set([lineLength, lineWidth]);
+    new Uint32Array(bytes, 24, 2).set([instances, 0]);
+    gpu.device.queue.writeBuffer(params, 0, bytes);
+
+    const floats = instances * MIRROR_FLOATS_PER_INSTANCE;
+    const output = createStorageBuffer(gpu.device, floats * 4, { label: 'mirror probe out' });
+
+    const encoder = gpu.device.createCommandEncoder({ label: 'vectors mirror probe' });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(
+        1,
+        gpu.device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(1),
+            entries: [
+                { binding: 0, resource: { buffer: params } },
+                { binding: 1, resource: { buffer: output } },
+            ],
+        })
+    );
+    pass.dispatchWorkgroups(Math.ceil(instances / 64), 1, 1);
+    pass.end();
+    gpu.device.queue.submit([encoder.finish()]);
+
+    const raw = new Float32Array(await readBuffer(gpu.device, output, floats * 4), 0, floats);
+    params.destroy();
+    output.destroy();
+
+    assert(!hasNonFinite(raw), 'the mirror probe produced non-finite geometry');
+
+    // f32 against f64, plus a cos/sin whose last bits are the driver's, so a
+    // tolerance rather than equality — and 2e-5 is still four orders of
+    // magnitude tighter than one line width.
+    const tolerance = 2e-5;
+    for (let instance = 0; instance < instances; instance++) {
+        const base = instance * MIRROR_FLOATS_PER_INSTANCE;
+        const [x, y] = vectorsGridPointAt(extent, instance);
+        const value = instance / instances;
+        const segment = vectorsLineSegment(x, y, value, lineLength);
+        const quad = vectorsLineQuad(segment, value, lineWidth);
+
+        assertClose(raw[base], x, tolerance, `instance ${instance} grid x`);
+        assertClose(raw[base + 1], y, tolerance, `instance ${instance} grid y`);
+        assertClose(raw[base + 2], segment[2], tolerance, `instance ${instance} segment end x`);
+        assertClose(raw[base + 3], segment[3], tolerance, `instance ${instance} segment end y`);
+
+        // The six drawn vertices, in `vectorsQuadIndices` order, against the
+        // four `vectorsLineQuad` corners. Each CPU corner is [x, y, value].
+        vectorsQuadIndices(0).forEach((corner, vertex) => {
+            const at = base + 4 + vertex * 2;
+            assertClose(raw[at], quad[corner * 3], tolerance, `instance ${instance} v${vertex} x`);
+            assertClose(
+                raw[at + 1],
+                quad[corner * 3 + 1],
+                tolerance,
+                `instance ${instance} v${vertex} y`
+            );
+        });
+    }
+});
+
+test('vectors constructs and tears down with no validation error', async () => {
+    gpu.device.pushErrorScope('validation');
+
+    const sim = await VectorsSimulation.create(gpu);
+    const [target, view] = renderTarget(48, 'vectors validation target');
+    sim.applySettings(visibleVectorsSettings());
+    sim.renderFrame(view, 1 / 60);
+    sim.renderFramePaused(view);
+    sim.resize(96, 96);
+    sim.renderFrame(view, 1 / 60);
+    sim.destroy();
+    sim.destroy();
+    target.destroy();
+
+    const error = await gpu.device.popErrorScope();
+    assert(error === null, `vectors produced a validation error: ${error?.message}`);
+});
+
+test('vectors unclamps the host camera and puts the clamp back', async () => {
+    // simulation.rs:85 — `set_position_clamp(None)`, because the pan is what
+    // moves the (infinite) noise field's origin. The host's camera outlives the
+    // simulation and `Camera.reset()` does not restore the clamp, so leaving it
+    // off would silently hand unbounded panning to the next mode opened.
+    const sim = await VectorsSimulation.create(gpu);
+    const host = new Camera(64, 64);
+    assert(host.getPositionClamp() !== null, 'a fresh camera is clamped');
+
+    sim.attachCamera(host);
+    assert(host.getPositionClamp() === null, 'vectors must unclamp the camera it is given');
+
+    for (let i = 0; i < 200; i++) host.pan(-40, 0);
+    host.update(1);
+    assert(
+        Math.abs(host.position[0]) > 2,
+        `panning stayed inside the default clamp (x = ${host.position[0]})`
+    );
+
+    sim.destroy();
+    assert(
+        host.getPositionClamp() !== null,
+        'the clamp must be restored on teardown, or the next simulation inherits it'
+    );
+    host.destroy();
+});
+
+test('vectors renders a varied, finite, deterministic field', async () => {
+    const [target, view] = renderTarget(64, 'vectors target');
+
+    const run = async (): Promise<Uint8Array> => {
+        const sim = await VectorsSimulation.create(gpu);
+        sim.applySettings(visibleVectorsSettings());
+        // Fixed dt, and the field is a pure function of (camera, settings,
+        // clock), so two runs of the same length must agree.
+        for (let i = 0; i < 4; i++) sim.renderFrame(view, 1 / 60);
+        const pixels = await readTexturePixels(gpu.device, target);
+        sim.destroy();
+        return pixels;
+    };
+
+    const first = await run();
+    assert(!hasNonFinite(first), 'vectors produced non-finite pixels');
+    assert(!isUniform(first), 'vectors produced a flat image — no line was rasterised');
+
+    const alpha = channelStats(first, channelOffset(gpu.format, 'a'));
+    assert(alpha.min === 255, `vectors must be opaque; found alpha down to ${alpha.min}`);
+
+    // Lines on a black clear: most of the frame is background, so the check is
+    // that a real minority of it is not.
+    const red = channelStats(first, channelOffset(gpu.format, 'r'));
+    assert(red.max > 64, `nothing bright was drawn: red tops out at ${red.max}`);
+    assert(red.deviation > 4, `image is nearly flat: red deviation ${red.deviation.toFixed(2)}`);
+
+    const second = await run();
+    const mae = meanAbsoluteError(first, second);
+    assert(mae <= 1, `two identical runs diverged by MAE ${mae.toFixed(3)}`);
+
+    target.destroy();
+});
+
+test('the vectors clock animates the field and a paused redraw does not', async () => {
+    const sim = await VectorsSimulation.create(gpu);
+    const [target, view] = renderTarget(48, 'vectors clock target');
+    // `noise_dt_multiplier` scales the animated z coordinate (simulation.rs:272),
+    // so a large one makes a few frames' worth of drift unmistakable.
+    sim.applySettings(visibleVectorsSettings({ noise_dt_multiplier: 40 }));
+
+    sim.renderFrame(view, 1 / 60);
+    const first = await readTexturePixels(gpu.device, target);
+
+    sim.renderFramePaused(view);
+    const paused = await readTexturePixels(gpu.device, target);
+    assert(
+        meanAbsoluteError(first, paused) === 0,
+        'a paused redraw must not advance the noise field'
+    );
+
+    sim.renderFrame(view, 1);
+    const later = await readTexturePixels(gpu.device, target);
+    assert(meanAbsoluteError(first, later) > 1, 'the field did not move with the clock');
+
+    // `reset_runtime_state` (simulation.rs:875) rewinds the clock, so the field
+    // has to come back to where it started.
+    sim.resetRuntimeState();
+    sim.renderFrame(view, 1 / 60);
+    const rewound = await readTexturePixels(gpu.device, target);
+    assert(
+        meanAbsoluteError(first, rewound) <= 1,
+        'resetRuntimeState did not rewind the animation'
+    );
+
+    sim.destroy();
+    target.destroy();
+});
+
+test('vectors honours VECTORS_MAX_LINES at the smallest density', async () => {
+    const sim = await VectorsSimulation.create(gpu);
+    const [target, view] = renderTarget(32, 'vectors density cap target');
+
+    // `VectorsMode.svelte:165` puts the density minimum at exactly 0.001, which
+    // the Rust would walk as a 2401 x 2401 grid: 5.77 M lines, a 277 MB vertex
+    // buffer against a 256 MiB `maxBufferSize`, rebuilt every frame. The clamp
+    // raises the *spacing* instead, so the field still covers the whole view.
+    sim.applySettings(visibleVectorsSettings({ density: 0.001 }));
+
+    const grid = sim.grid;
+    assert(grid.clamped, 'the smallest density must trip the clamp');
+    assert(
+        grid.count <= VECTORS_MAX_LINES,
+        `${grid.count} lines exceeds the ${VECTORS_MAX_LINES} budget`
+    );
+    assertClose(grid.spacing * (grid.countX - 1), 2.4, 1e-3, 'the clamped grid must span the view');
+
+    gpu.device.pushErrorScope('validation');
+    sim.renderFrame(view, 1 / 60);
+    assert(
+        sim.instanceCount === grid.count,
+        `drew ${sim.instanceCount} instances for a ${grid.count}-line grid`
+    );
+    const error = await gpu.device.popErrorScope();
+    assert(error === null, `the capped draw failed validation: ${error?.message}`);
+
+    const pixels = await readTexturePixels(gpu.device, target);
+    assert(!isUniform(pixels), 'the densest field drew nothing');
+
+    // And the cap is not a permanent ceiling: an ordinary density is unclamped.
+    sim.updateSetting('density', 0.02);
+    assert(!sim.grid.clamped, 'the default density must not be clamped');
+
+    sim.destroy();
+    target.destroy();
+});
+
+test('panning moves the vectors field and zooming changes its density', async () => {
+    const sim = await VectorsSimulation.create(gpu);
+    const [target, view] = renderTarget(64, 'vectors camera target');
+    sim.applySettings(visibleVectorsSettings());
+
+    sim.renderFrame(view, 1 / 60);
+    const atOrigin = await readTexturePixels(gpu.device, target);
+    const linesAtOrigin = sim.instanceCount;
+
+    // Pan: the grid origin is `camera - 1.2 / zoom` (simulation.rs:266), so the
+    // sample coordinates move and a different part of the noise is drawn. The
+    // line *count* must not change — same zoom, same density.
+    const camera = simCamera(sim);
+    for (let i = 0; i < 20; i++) camera.pan(-30, 12);
+    for (let i = 0; i < 25; i++) sim.renderFrame(view, 1 / 60);
+    const panned = await readTexturePixels(gpu.device, target);
+
+    assert(!hasNonFinite(panned), 'panning produced non-finite pixels');
+    assert(!isUniform(panned), 'panning produced a flat image');
+    assert(meanAbsoluteError(atOrigin, panned) > 1, 'panning did not move the field');
+    assert(
+        sim.instanceCount === linesAtOrigin,
+        `panning changed the line count from ${linesAtOrigin} to ${sim.instanceCount}`
+    );
+
+    // Zoom: the half-span is 1.2 / zoom, so zooming out covers more world at the
+    // same spacing and there are strictly more lines to draw. Four notches
+    // rather than a dramatic one — the line count grows as 1/zoom² and every one
+    // of them is six vertices through a software rasteriser.
+    for (let i = 0; i < 4; i++) camera.zoomBy(-1);
+    for (let i = 0; i < 25; i++) sim.renderFrame(view, 1 / 60);
+
+    assert(camera.zoom < 1, `zoomBy(-1) did not zoom out (zoom = ${camera.zoom})`);
+    assert(
+        sim.instanceCount > linesAtOrigin,
+        `zooming out drew ${sim.instanceCount} lines, no more than the ${linesAtOrigin} at zoom 1`
+    );
+    const zoomedOut = await readTexturePixels(gpu.device, target);
+    assert(!isUniform(zoomedOut), 'zooming out produced a flat image');
+    assert(meanAbsoluteError(panned, zoomedOut) > 1, 'zooming out did not change what is drawn');
+
+    sim.destroy();
+    target.destroy();
+});
+
+test('each vector field type draws a different picture', async () => {
+    const [target, view] = renderTarget(64, 'vectors field type target');
+
+    const render = async (
+        overrides: Record<string, unknown>,
+        withImage = false
+    ): Promise<Uint8Array> => {
+        const sim = await VectorsSimulation.create(gpu);
+        sim.applySettings(visibleVectorsSettings(overrides));
+        if (withImage) {
+            await sim.loadImage(await splitImageFile(64), 'vector_field');
+            assert(sim.hasImage, 'loadImage must leave an image texture bound');
+        }
+        sim.renderFrame(view, 1 / 60);
+        const pixels = await readTexturePixels(gpu.device, target);
+        sim.destroy();
+        return pixels;
+    };
+
+    const noise = await render({ vector_field_type: 'Noise' });
+    const imageless = await render({ vector_field_type: 'Image' });
+    const image = await render({ vector_field_type: 'Image' }, true);
+
+    // Image mode with no image is the Rust's neutral 0.5 everywhere
+    // (simulation.rs:308): every line the same angle, length and colour, i.e. a
+    // comb. That is a different picture from the noise field, and from the
+    // picture the same mode draws once a real image arrives.
+    assert(
+        meanAbsoluteError(noise, imageless) > 1,
+        'switching to Image mode changed nothing — field_type is not reaching the shader'
+    );
+    assert(
+        meanAbsoluteError(imageless, image) > 1,
+        'loading an image changed nothing — binding 3 is still the placeholder'
+    );
+    assert(!hasNonFinite(image), 'the image path produced non-finite pixels');
+    assert(!isUniform(image), 'the image path drew nothing');
+});
+
+test('the vectors image field reaches the render, split for split', async () => {
+    const sim = await VectorsSimulation.create(gpu);
+    const [target, view] = renderTarget(64, 'vectors image target');
+
+    // The default LUT is a grey ramp, so a sample of 0 draws black-on-black and
+    // a sample of 1 draws white: a black|white image must therefore come out as
+    // an empty left half and a bright right half. That is the whole chain —
+    // decode, fit, greyscale, r8unorm upload, `textureLoad` in the vertex stage,
+    // LUT lookup in the fragment stage — asserted in one number.
+    sim.applySettings(visibleVectorsSettings({ vector_field_type: 'Image' }));
+    await sim.loadImage(await splitImageFile(64), 'vector_field');
+    sim.renderFrame(view, 1 / 60);
+
+    const pixels = await readTexturePixels(gpu.device, target);
+    const red = channelOffset(gpu.format, 'r');
+    let left = 0;
+    let right = 0;
+    for (let y = 0; y < 64; y++) {
+        for (let x = 0; x < 64; x++) {
+            const value = pixels[(y * 64 + x) * 4 + red];
+            if (x < 24) left += value;
+            else if (x >= 40) right += value;
+        }
+    }
+    const leftMean = left / (24 * 64);
+    const rightMean = right / (24 * 64);
+    assert(
+        rightMean - leftMean > 8,
+        `the image's black|white split did not survive the upload: ` +
+            `left ${leftMean.toFixed(1)} vs right ${rightMean.toFixed(1)}`
+    );
+
+    // Inverting the tone is a CPU re-fit (simulation.rs:532), not a shader flag
+    // as it is in Moiré, so it has to actually re-upload the texture.
+    sim.updateSetting('image_invert_tone', true);
+    sim.renderFrame(view, 1 / 60);
+    const inverted = await readTexturePixels(gpu.device, target);
+    assert(
+        meanAbsoluteError(pixels, inverted) > 1,
+        'inverting the tone did not re-fit and re-upload the image'
+    );
+
+    sim.destroy();
+    target.destroy();
+});
+
+test('vectors create/destroy x20 leaves the resource ledger clean', async () => {
+    const ledger = new ResourceLedger();
+    const instrumented: GpuContext = { ...gpu, device: instrumentDevice(gpu.device, ledger) };
+
+    // Allocated on the *uninstrumented* device, so the test's own target does
+    // not show up in the ledger it is asserting on.
+    const churnTarget = gpu.device.createTexture({
+        label: 'vectors churn target',
+        size: { width: 32, height: 32 },
+        format: gpu.format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    const churnView = churnTarget.createView();
+
+    for (let i = 0; i < 20; i++) {
+        const sim = await VectorsSimulation.create(instrumented);
+        sim.applySettings(visibleVectorsSettings());
+        // Load an image on half the cycles: the image texture is the one
+        // resource created after construction, so a leak there would otherwise
+        // never be exercised.
+        if (i % 2 === 0) await sim.loadImage(await splitImageFile(16), 'vector_field');
+        sim.renderFrame(churnView, 1 / 60);
+        sim.destroy();
+        sim.destroy();
+    }
+
+    const stats = ledger.stats();
+    // Four per simulation: the params uniform, the LUT storage buffer, the
+    // placeholder image texture and the camera uniform.
+    assert(
+        stats.created >= 20 * 4,
+        `expected at least four tracked objects per simulation, saw ${stats.created} over 20`
+    );
+    assert(
+        stats.live === 0,
+        `${stats.live} GPU objects leaked over 20 cycles: ${JSON.stringify(stats.byLabel)}`
+    );
+
+    gpu.device.pushErrorScope('validation');
+    const probe = createStorageBuffer(gpu.device, 256, { label: 'post-vectors probe' });
+    const error = await gpu.device.popErrorScope();
+    assert(error === null, `device unhealthy after 20 vectors cycles: ${error?.message}`);
     probe.destroy();
     churnTarget.destroy();
 });

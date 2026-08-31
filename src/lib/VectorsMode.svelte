@@ -18,7 +18,8 @@
             <CollapsibleFieldset title="About this simulation" bind:open={show_about_section}>
                 <p>
                     Vectors renders a grid of lines where direction and length are derived from a
-                    noise field. Pan and zoom move the camera through the field (WASD, Q/E, or mouse).
+                    noise field. Pan and zoom move the camera through the field (WASD, Q/E, or
+                    mouse).
                 </p>
             </CollapsibleFieldset>
 
@@ -36,7 +37,7 @@
                     <label for="backgroundColorMode">Background</label>
                     <Selector
                         id="backgroundColorMode"
-                        options={['Black', 'White', 'Gray18', 'Color Scheme']}
+                        options={backgroundColorModeOptions}
                         value={settings?.background_color_mode}
                         on:change={({ detail }) =>
                             updateSetting('background_color_mode', detail.value)}
@@ -60,12 +61,9 @@
                     <label class="setting-label" for="vector-field-type">Vector Field Type</label>
                     <Selector
                         id="vector-field-type"
-                        options={['Noise', 'Image']}
+                        options={vectorFieldTypeOptions}
                         value={settings?.vector_field_type ?? 'Noise'}
-                        on:change={({ detail }) => {
-                            if (detail.value === 'Noise' && webcamActive) stopWebcam();
-                            updateSetting('vector_field_type', detail.value);
-                        }}
+                        on:change={({ detail }) => updateSetting('vector_field_type', detail.value)}
                     />
                 </div>
                 {#if settings?.vector_field_type === 'Image'}
@@ -74,12 +72,15 @@
                         loadCommand="load_vectors_vector_field_image"
                         onFitModeChange={(value) => updateImageFitMode(value)}
                     />
-                    <WebcamControls
-                        {webcamDevices}
-                        {webcamActive}
-                        onStartWebcam={startWebcam}
-                        onStopWebcam={stopWebcam}
-                    />
+                    <!--
+                        WebcamControls used to sit here. Webcam capture is an
+                        omitted feature of this port (WEB_PORT.md, "Omitted
+                        features"), and its three `vectors_*` commands could only
+                        ever have resolved to empty stubs — so the panel is
+                        removed outright rather than shipped as a permanently
+                        greyed-out Start button next to an empty device list.
+                        M4 did the same to Gray-Scott's.
+                    -->
                     <div class="control-group">
                         <label class="setting-label" for="image-mirror-h">Mirror Horizontal</label>
                         <input
@@ -87,7 +88,10 @@
                             type="checkbox"
                             checked={settings?.image_mirror_horizontal ?? false}
                             on:change={(e) =>
-                                updateSetting('image_mirror_horizontal', (e.target as HTMLInputElement).checked)}
+                                updateSetting(
+                                    'image_mirror_horizontal',
+                                    (e.target as HTMLInputElement).checked
+                                )}
                         />
                     </div>
                     <div class="control-group">
@@ -97,7 +101,10 @@
                             type="checkbox"
                             checked={settings?.image_mirror_vertical ?? false}
                             on:change={(e) =>
-                                updateSetting('image_mirror_vertical', (e.target as HTMLInputElement).checked)}
+                                updateSetting(
+                                    'image_mirror_vertical',
+                                    (e.target as HTMLInputElement).checked
+                                )}
                         />
                     </div>
                     <div class="control-group">
@@ -107,53 +114,71 @@
                             type="checkbox"
                             checked={settings?.image_invert_tone ?? false}
                             on:change={(e) =>
-                                updateSetting('image_invert_tone', (e.target as HTMLInputElement).checked)}
+                                updateSetting(
+                                    'image_invert_tone',
+                                    (e.target as HTMLInputElement).checked
+                                )}
                         />
                     </div>
                 {/if}
                 {#if settings?.vector_field_type === 'Noise'}
-                <div class="control-group">
-                    <label class="setting-label" for="noise-type">Noise Type</label>
-                    <Selector
-                        id="noise-type"
-                        options={['OpenSimplex', 'Worley', 'Value', 'Fbm', 'FBMBillow', 'FBMClouds', 'FBMRidged', 'Billow', 'RidgedMulti', 'Cylinders', 'Checkerboard']}
-                        value={settings?.noise_type ?? 'OpenSimplex'}
-                        on:change={({ detail }) => updateSetting('noise_type', detail.value)}
-                    />
-                </div>
-                <div class="control-group">
-                    <label class="setting-label" for="noise-seed">Noise Seed:</label>
-                    <NumberDragBox
-                        id="noise-seed"
-                        value={settings.noise_seed as number}
-                        on:change={({ detail }) => updateSetting('noise_seed', detail)}
-                        min={0}
-                        max={4294967295}
-                        step={1}
-                    />
-                </div>
-                <div class="control-group">
-                    <label class="setting-label" for="noise-scale">Noise Scale:</label>
-                    <NumberDragBox
-                        id="noise-scale"
-                        value={settings.noise_scale as number}
-                        on:change={({ detail }) => updateSetting('noise_scale', detail)}
-                        min={0.001}
-                        max={100.0}
-                        step={0.001}
-                    />
-                </div>
-                <div class="control-group">
-                    <label class="setting-label" for="noise-dt">Noise DT Multiplier:</label>
-                    <NumberDragBox
-                        id="noise-dt"
-                        value={settings.noise_dt_multiplier as number}
-                        on:change={({ detail }) => updateSetting('noise_dt_multiplier', detail)}
-                        min={0.0}
-                        max={10.0}
-                        step={0.1}
-                    />
-                </div>
+                    <div class="control-group">
+                        <label class="setting-label" for="noise-type">Noise Type</label>
+                        <Selector
+                            id="noise-type"
+                            options={noiseTypeOptions}
+                            value={settings?.noise_type ?? 'OpenSimplex'}
+                            on:change={({ detail }) => updateSetting('noise_type', detail.value)}
+                        />
+                    </div>
+                    <!--
+                        Every drag box below carries an explicit `precision`.
+                        NumberDragBox defaults it to 2 and formats with
+                        `parseFloat(value.toFixed(precision))`, so with the
+                        0.001 steps these controls use, Line Width's default of
+                        0.001 rendered as "0" and stayed "0" across its entire
+                        lower range — a control that changed nothing on screen
+                        when dragged. Density and Line Length had the same
+                        problem one digit further out. Every other mode with
+                        sub-0.01 steps (Flow, Pellets, Voronoi CA) already
+                        passes this prop.
+                    -->
+                    <div class="control-group">
+                        <label class="setting-label" for="noise-seed">Noise Seed:</label>
+                        <NumberDragBox
+                            id="noise-seed"
+                            value={settings.noise_seed as number}
+                            on:change={({ detail }) => updateSetting('noise_seed', detail)}
+                            min={0}
+                            max={4294967295}
+                            step={1}
+                            precision={0}
+                        />
+                    </div>
+                    <div class="control-group">
+                        <label class="setting-label" for="noise-scale">Noise Scale:</label>
+                        <NumberDragBox
+                            id="noise-scale"
+                            value={settings.noise_scale as number}
+                            on:change={({ detail }) => updateSetting('noise_scale', detail)}
+                            min={0.001}
+                            max={100.0}
+                            step={0.001}
+                            precision={3}
+                        />
+                    </div>
+                    <div class="control-group">
+                        <label class="setting-label" for="noise-dt">Noise DT Multiplier:</label>
+                        <NumberDragBox
+                            id="noise-dt"
+                            value={settings.noise_dt_multiplier as number}
+                            on:change={({ detail }) => updateSetting('noise_dt_multiplier', detail)}
+                            min={0.0}
+                            max={10.0}
+                            step={0.1}
+                            precision={1}
+                        />
+                    </div>
                 {/if}
                 <div class="control-group">
                     <label class="setting-label" for="density">Density:</label>
@@ -164,6 +189,7 @@
                         min={0.001}
                         max={0.1}
                         step={0.001}
+                        precision={3}
                     />
                 </div>
                 <div class="control-group">
@@ -175,6 +201,7 @@
                         min={0.005}
                         max={1.0}
                         step={0.001}
+                        precision={3}
                     />
                 </div>
                 <div class="control-group">
@@ -186,6 +213,7 @@
                         min={0.001}
                         max={1.0}
                         step={0.001}
+                        precision={3}
                     />
                 </div>
                 <div class="control-group">
@@ -200,7 +228,7 @@
 
 <script lang="ts">
     import { onMount, onDestroy } from 'svelte';
-    import { invoke } from '$lib/rpc';
+    import { invoke, listen } from '$lib/rpc';
     import SimulationLayout from './components/shared/SimulationLayout.svelte';
     import CollapsibleFieldset from './components/shared/CollapsibleFieldset.svelte';
     import PresetFieldset from './components/shared/PresetFieldset.svelte';
@@ -209,11 +237,38 @@
     import NumberDragBox from './components/inputs/NumberDragBox.svelte';
     import Button from './components/shared/Button.svelte';
     import ImageSelector from './components/shared/ImageSelector.svelte';
-    import WebcamControls from './components/shared/WebcamControls.svelte';
     import CameraControls from './components/shared/CameraControls.svelte';
     import { AutoHideManager, createAutoHideEventListeners } from './utils/autoHide';
     import { createSyncManager } from './utils/sync';
     import type { AppMode } from '../types/app';
+    import {
+        BACKGROUND_COLOR_MODES,
+        NOISE_TYPES,
+        VECTOR_FIELD_TYPES,
+        type BackgroundColorMode,
+        type NoiseType,
+        type VectorFieldType,
+    } from '$lib/engine/sims/vectors/settings';
+    import type { ImageFitMode } from '$lib/engine/resources/imageUpload';
+
+    /*
+     * The option lists come from the engine rather than being spelled out here,
+     * so the two copies cannot drift into the round-trip failure M3 and M4 each
+     * hit: a `<Selector>` whose options miss the spelling `get_settings`
+     * returns renders its *placeholder* instead of the selection, and its ◀/▶
+     * buttons then cycle from `indexOf() === -1`.
+     *
+     * These are the **serde** spellings, which is what `get_settings` emits and
+     * what `update_setting` parses — so `Fbm` and `FBMBillow` appear in the
+     * dropdown exactly as inconsistently as `settings.rs` declares them. The
+     * prettier `Display` names ("FBM", "FBM Billow") exist as
+     * `NOISE_TYPE_LABELS`, but showing them would mean translating on the way in
+     * *and* out, which is precisely the construct that broke Gray-Scott. Left as
+     * a presentation decision for M14, where every mode's labels get one pass.
+     */
+    const backgroundColorModeOptions: string[] = [...BACKGROUND_COLOR_MODES];
+    const noiseTypeOptions: string[] = [...NOISE_TYPES];
+    const vectorFieldTypeOptions: string[] = [...VECTOR_FIELD_TYPES];
 
     export let menuPosition: 'left' | 'right' | 'middle' = 'right';
     export let autoHideDelay: number = 1000;
@@ -233,20 +288,30 @@
 
     let autoHideManager: AutoHideManager;
     let eventListeners: { add: () => void; remove: () => void };
+    let fpsUnlisten: (() => void) | null = null;
 
-    let webcamDevices: number[] = [];
-    let webcamActive = false;
-
+    /**
+     * Mirrors `VectorsSettings` (engine/sims/vectors/settings.ts), which mirrors
+     * `settings.rs`. Every field is optional because `get_current_settings`
+     * degrades to `{}` when there is no engine at all, and the markup binds
+     * through `settings?.x` for the same reason.
+     *
+     * `noise_seed` was **missing** from this interface before M5 while
+     * `settings.noise_seed as number` read it anyway through the index
+     * signature — so the one field the type could have caught was the one it
+     * silently let through.
+     */
     interface Settings {
-        vector_field_type?: string;
-        noise_type: string;
-        noise_scale: number;
-        noise_dt_multiplier: number;
-        density: number;
-        line_length: number;
-        line_width: number;
-        background_color_mode: string;
-        image_fit_mode?: string;
+        vector_field_type?: VectorFieldType;
+        noise_type?: NoiseType;
+        noise_seed?: number;
+        noise_scale?: number;
+        noise_dt_multiplier?: number;
+        density?: number;
+        line_length?: number;
+        line_width?: number;
+        background_color_mode?: BackgroundColorMode;
+        image_fit_mode?: ImageFitMode;
         image_mirror_horizontal?: boolean;
         image_mirror_vertical?: boolean;
         image_invert_tone?: boolean;
@@ -270,10 +335,18 @@
             autoHideManager = new AutoHideManager(
                 { controlsVisible, cursorHidden: false, showUI, running },
                 {
-                    onControlsShow: () => { controlsVisible = true; },
-                    onControlsHide: () => { controlsVisible = false; },
-                    onCursorShow: () => { document.body.style.cursor = ''; },
-                    onCursorHide: () => { document.body.style.cursor = 'none'; },
+                    onControlsShow: () => {
+                        controlsVisible = true;
+                    },
+                    onControlsHide: () => {
+                        controlsVisible = false;
+                    },
+                    onCursorShow: () => {
+                        document.body.style.cursor = '';
+                    },
+                    onCursorHide: () => {
+                        document.body.style.cursor = 'none';
+                    },
                 },
                 { autoHideDelay, cursorHideDelay: 2000 }
             );
@@ -283,14 +356,12 @@
             });
             eventListeners.add();
 
+            fpsUnlisten = await listen('fps-update', (event) => {
+                currentFps = event.payload as number;
+            });
+
             await invoke('start_simulation', { simulationType: 'vectors' });
-            await Promise.all([
-                loadSettings(),
-                loadState(),
-                loadPresets(),
-                loadColorSchemes(),
-                loadWebcamDevices(),
-            ]);
+            await Promise.all([loadSettings(), loadState(), loadPresets(), loadColorSchemes()]);
             startRenderLoop();
 
             running = true;
@@ -302,12 +373,14 @@
     });
 
     onDestroy(() => {
-        if (webcamActive) {
-            invoke('stop_vectors_webcam_capture').catch(console.error);
-        }
+        // The rAF chain was cancelled only by `returnToMenu`, so any other route
+        // out of this component — a navigation that swaps `currentMode`, an HMR
+        // update — left it running against a destroyed simulation forever.
+        stopRenderLoop();
         if (running) {
             invoke('destroy_simulation').catch(console.error);
         }
+        if (fpsUnlisten) fpsUnlisten();
         if (eventListeners) eventListeners.remove();
         if (autoHideManager) autoHideManager.cleanup();
     });
@@ -333,6 +406,23 @@
     async function updateLutName(name: string) {
         try {
             await invoke('apply_color_scheme_by_name', { colorSchemeName: name });
+            /*
+             * `apply_color_scheme_by_name` pushes the LUT bytes at the
+             * simulation (handlers/colorSchemes.ts -> updateColorScheme) but
+             * never writes the *name* into simulation state — the engine seam
+             * carries only the buffer and the reversed flag. The <Selector>
+             * above binds to `state.current_color_scheme`, and this function
+             * ends in a state sync, so without this second call the highlight
+             * snapped straight back to whatever the engine still held. Exactly
+             * the defect M4 fixed in GrayScottMode.svelte:832.
+             *
+             * `color_scheme_reversed` needs no equivalent: it *is* part of the
+             * updateColorScheme seam, so the engine mirrors it on its own.
+             */
+            await invoke('update_simulation_state', {
+                stateName: 'current_color_scheme',
+                value: name,
+            });
             await loadState();
         } catch (e) {
             console.error('Failed to update LUT:', e);
@@ -348,31 +438,14 @@
         }
     }
 
-    async function loadWebcamDevices() {
-        try {
-            webcamDevices = (await invoke('get_available_vectors_webcam_devices')) as number[];
-        } catch (e) {
-            console.error('Failed to load vectors webcam devices:', e);
-        }
-    }
-
-    async function startWebcam() {
-        try {
-            await invoke('start_vectors_webcam_capture');
-            webcamActive = true;
-        } catch (e) {
-            console.error('Failed to start vectors webcam:', e);
-        }
-    }
-
-    async function stopWebcam() {
-        try {
-            await invoke('stop_vectors_webcam_capture');
-            webcamActive = false;
-        } catch (e) {
-            console.error('Failed to stop vectors webcam:', e);
-        }
-    }
+    /*
+     * `loadWebcamDevices`, `startWebcam` and `stopWebcam` lived here and called
+     * `get_available_vectors_webcam_devices`, `start_vectors_webcam_capture`
+     * and `stop_vectors_webcam_capture`. All three are gone with the panel, and
+     * their registry stubs with them — the completeness test in
+     * test/unit/registry.test.ts asserts both directions, so an orphaned handler
+     * fails just as loudly as a missing one.
+     */
 
     async function updateImageFitMode(value: string) {
         try {
@@ -469,8 +542,12 @@
         async function renderLoop() {
             if (renderLoopId === null) return;
             try {
+                // A redraw request, not the frame pump — `RenderLoop` owns the
+                // real rAF chain (handlers/lifecycle.ts:112). `currentFps` used
+                // to be assigned a hardcoded 60 here, which is a number the HUD
+                // displayed as if it were measured; the real figure arrives on
+                // the `fps-update` event this mode now listens for.
                 await invoke('render_frame');
-                currentFps = 60;
             } catch (e) {
                 console.error('Render failed:', e);
             }

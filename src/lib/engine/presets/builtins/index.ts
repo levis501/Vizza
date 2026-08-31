@@ -33,6 +33,7 @@ import type { SimulationId } from '../../types';
 import type { PresetSettings } from '../PresetStore';
 import { GRAY_SCOTT_BUILTIN_PRESETS } from './grayScott';
 import { MOIRE_BUILTIN_PRESETS } from './moire';
+import { VECTORS_BUILTIN_PRESETS } from './vectors';
 
 export interface BuiltinPreset {
     name: string;
@@ -75,3 +76,4 @@ export function clearBuiltinPresets(): void {
 // --- Registrations, one line per ported simulation --------------------------
 registerBuiltinPresets('moire', MOIRE_BUILTIN_PRESETS);
 registerBuiltinPresets('gray_scott', GRAY_SCOTT_BUILTIN_PRESETS);
+registerBuiltinPresets('vectors', VECTORS_BUILTIN_PRESETS);

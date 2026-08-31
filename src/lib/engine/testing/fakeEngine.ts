@@ -32,6 +32,15 @@ import {
     updateGrayScottSetting,
     updateGrayScottState,
 } from '$lib/engine/sims/grayScott/settings';
+import {
+    defaultVectorsSettings,
+    defaultVectorsState,
+    normalizeVectorsSettings,
+    updateVectorsSetting,
+    updateVectorsState,
+    vectorsStateDocument,
+    type VectorsState,
+} from '$lib/engine/sims/vectors/settings';
 
 /**
  * Runtime state the moded UIs read when a simulation has no ported state model.
@@ -59,6 +68,14 @@ interface SettingsModel {
      * scheme. Optional: a mode with no state model keeps `legacyDefaultState`.
      */
     state?(): Record<string, unknown>;
+    /**
+     * Project the stored state onto what `getState()` actually hands out.
+     *
+     * Only needed where the two differ — Vectors keeps four geometry-cache
+     * fields that its `get_state` never returned, and a fake that leaked them
+     * would let a mode bind to a field the real engine never sends.
+     */
+    stateDocument?(state: Record<string, unknown>): Record<string, unknown>;
     /**
      * Apply one `update_simulation_state`. Optional for the same reason, and
      * worth providing where it exists: the real model *throws* on an unknown
@@ -112,6 +129,28 @@ const MODELS: Record<string, SettingsModel> = {
         updateState: (state, name, value) =>
             void updateGrayScottState(
                 state as unknown as Parameters<typeof updateGrayScottState>[0],
+                name,
+                value
+            ),
+    },
+    vectors: {
+        defaults: () => defaultVectorsSettings() as unknown as Record<string, unknown>,
+        update: (settings, name, value) =>
+            void updateVectorsSetting(
+                settings as unknown as Parameters<typeof updateVectorsSetting>[0],
+                name,
+                value
+            ),
+        normalize: (input) => normalizeVectorsSettings(input) as unknown as Record<string, unknown>,
+        // Vectors' `get_state` returns a *subset* of `State` (two fields in the
+        // Rust, five here), and the mode reads `current_color_scheme` straight
+        // out of it, so the document shape has to be the real one. Storing the
+        // full state and projecting on read is what keeps that honest.
+        state: () => defaultVectorsState() as unknown as Record<string, unknown>,
+        stateDocument: (state) => vectorsStateDocument(state as unknown as VectorsState),
+        updateState: (state, name, value) =>
+            void updateVectorsState(
+                state as unknown as Parameters<typeof updateVectorsState>[0],
                 name,
                 value
             ),
@@ -184,7 +223,8 @@ export class FakeEngine implements EngineContext {
     }
 
     async getState(): Promise<Record<string, unknown>> {
-        return { ...this.state };
+        const model = this.model();
+        return model.stateDocument ? model.stateDocument(this.state) : { ...this.state };
     }
 
     async updateSetting(name: string, value: unknown): Promise<void> {

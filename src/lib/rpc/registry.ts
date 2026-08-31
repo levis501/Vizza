@@ -74,7 +74,8 @@ for (const name of [
     'render_frame',
     'seed_random_noise',
     'kill_all_particles',
-]) stub(name);
+])
+    stub(name);
 
 // ---------------------------------------------------------------------------
 // Settings and state
@@ -87,7 +88,8 @@ for (const name of [
     'update_particle_life_setting',
     'update_pellets_trails_state',
     'update_agent_count',
-]) stub(name);
+])
+    stub(name);
 stub('get_current_agent_count', null);
 
 // ---------------------------------------------------------------------------
@@ -103,7 +105,8 @@ for (const name of [
     'handle_mouse_release',
     'update_cursor_size',
     'update_cursor_strength',
-]) stub(name);
+])
+    stub(name);
 /*
  * `update_cursor_position_screen` and `get_camera_state` used to be stubbed
  * here. GrayScottMode was the only caller of either, and M4 removed both calls:
@@ -130,7 +133,8 @@ for (const name of [
     'toggle_fullscreen',
     'save_app_settings',
     'reset_app_settings',
-]) stub(name);
+])
+    stub(name);
 stub('get_app_settings', {});
 stub('get_current_window_size', {
     width: typeof window !== 'undefined' ? window.innerWidth : 1600,
@@ -148,7 +152,8 @@ for (const name of [
     'save_custom_color_scheme',
     'update_gradient_preview',
     'set_gradient_display_mode',
-]) stub(name);
+])
+    stub(name);
 
 // ---------------------------------------------------------------------------
 // Presets
@@ -189,7 +194,8 @@ for (const name of [
     'load_flow_vector_field_image',
     'load_vectors_vector_field_image',
     'load_moire_image',
-]) stub(name);
+])
+    stub(name);
 
 for (const name of [
     'set_slime_mold_position_image_fit_mode',
@@ -199,7 +205,8 @@ for (const name of [
     'set_flow_image_mirror_horizontal',
     'set_flow_image_mirror_vertical',
     'set_flow_image_invert_tone',
-]) stub(name);
+])
+    stub(name);
 
 // ---------------------------------------------------------------------------
 // Webcam — omitted from the browser port. Device enumeration returns empty so
@@ -207,10 +214,12 @@ for (const name of [
 // ---------------------------------------------------------------------------
 // Gray-Scott's three are absent: M4 deleted its WebcamControls outright rather
 // than ship a Start button that is permanently greyed out, so nothing calls them.
-for (const sim of ['', 'flow_', 'moire_', 'vectors_']) {
+// M5 did the same to Vectors', so the three `vectors_` names are gone too. Flow,
+// Moiré and Slime Mold still have their panels and so still need theirs.
+for (const sim of ['', 'flow_', 'moire_']) {
     stub(`get_available_${sim}webcam_devices`, []);
 }
-for (const sim of ['slime_mold', 'flow', 'moire', 'vectors']) {
+for (const sim of ['slime_mold', 'flow', 'moire']) {
     stub(`start_${sim}_webcam_capture`);
     stub(`stop_${sim}_webcam_capture`);
 }
