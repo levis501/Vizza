@@ -125,30 +125,72 @@ fn sample_mask_with_mirror_invert(pos: vec2<f32>) -> f32 {
     return v;
 }
 
+// `MaskPattern::Disabled` — slot 11 of SimSizeUniform, and gradient.wgsl's
+// MASK_DISABLED. Repeated rather than shared because the two shaders are
+// separate modules.
+const MASK_DISABLED: u32 = 0u;
+
+// The mask's shaped value at a position, in [0, 1].
+//
+// This is the *pattern* alone: whatever `generate_mask` wrote, mirrored and
+// tone-inverted as configured, then shaped by `mask_curve`. `mask_strength` is
+// deliberately **not** folded in here — it is a blend weight, not a scale, and
+// keeping the two apart is what makes the Strength control observable; see
+// `mask_blend` below.
+//
+// Returns 0 for a Disabled pattern instead of reading `mask_map`, because the
+// buffer's contents are undefined while no pattern is selected: the desktop
+// build skips its `generate_mask` dispatch for Disabled *and* Image
+// (simulation.rs:993), so the previous pattern sits there indefinitely.
+fn mask_value_at(x: f32, y: f32) -> f32 {
+    if (sim_size.mask_pattern == MASK_DISABLED) {
+        return 0.0;
+    }
+    let raw = sample_mask_with_mirror_invert(vec2<f32>(x, y));
+    return pow(clamp(raw, 0.0, 1.0), max(0.0001, sim_size.mask_curve));
+}
+
+// How far the mask displaces a parameter from the value the user authored.
+//
+// 0 means the mask has no effect at all — the parameter is exactly what the
+// control says, and the simulation is indistinguishable from a Disabled mask.
+// 1 hands the parameter entirely to the mask's target range. A Disabled pattern
+// is 0 by construction, which is what stops a stale `mask_target` from acting
+// on a mask that is not there.
+//
+// **This is a deliberate change of meaning for `mask_strength`, shared with the
+// desktop build.** It used to be a multiplier folded into the mask value before
+// the target branches, which made those branches quadratic in it — and for the
+// Pheromone Deposition target, whose range maximum (100) is also the deposition
+// rate's default *and* the UI's maximum, exactly cancelling: on a hard 0/1
+// pattern the deposition rate came out at 100 for every strength. See the M7
+// notes in WEB_PORT.md.
+fn mask_blend() -> f32 {
+    if (sim_size.mask_pattern == MASK_DISABLED) {
+        return 0.0;
+    }
+    return clamp(sim_size.mask_strength, 0.0, 1.0);
+}
+
 // Combined function to sample both trail and mask
+//
+// The mask contribution is scaled by `mask_blend()` and shaped by `mask_curve`,
+// so a mask the agents can smell obeys the same two controls as a mask that
+// modulates a parameter. Before, this route added the *raw* mask value and was
+// structurally deaf to both: at 1 M agents it is the dominant visible effect of
+// the mask, and it did not change by a pixel as Strength swept 0 to 1.
 fn sample_combined_map(pos: vec2<f32>) -> f32 {
     let trail_value = sample_trail_map(pos);
-    var mask_value: f32 = 0.0;
-    if (sim_size.mask_pattern != 0u) {
-        mask_value = sample_mask_with_mirror_invert(pos);
-    }
-    return trail_value + mask_value;
+    return trail_value + mask_value_at(pos.x, pos.y) * mask_blend();
 }
 
-// Fast combined sampling for performance-critical paths
+// Fast combined sampling for performance-critical paths.
+// Must stay in lockstep with `sample_combined_map`: the two feed the same
+// sensors, so any divergence makes agents behave differently depending only on
+// which sampler the caller happened to pick.
 fn sample_combined_map_fast(pos: vec2<f32>) -> f32 {
     let trail_value = sample_trail_map_fast(pos);
-    var mask_value: f32 = 0.0;
-    if (sim_size.mask_pattern != 0u) {
-        mask_value = sample_mask_with_mirror_invert(pos);
-    }
-    return trail_value + mask_value;
-}
-
-// Get mask factor for the current position
-fn get_mask_factor(x: f32, y: f32) -> f32 {
-    // Sample from precomputed mask map with unified mirror/invert
-    return sample_mask_with_mirror_invert(vec2<f32>(x, y));
+    return trail_value + mask_value_at(pos.x, pos.y) * mask_blend();
 }
 
 // Parameters for the simulation (now mostly from uniform)
@@ -198,46 +240,50 @@ fn update_agents(
     var angle = agent.z;
     var speed = agent.w;
 
-    // Get mask factor for this position, apply curve and strength
-    var mask_factor = get_mask_factor(x, y);
-    mask_factor = pow(clamp(mask_factor, 0.0, 1.0), max(0.0001, sim_size.mask_curve));
-    mask_factor = clamp(mask_factor * sim_size.mask_strength, 0.0, 1.0);
-    
+    // The mask's shaped pattern value here, and how far it is allowed to move a
+    // parameter. Every branch below is `mix(authored, target, mask_weight)`, so
+    // a strength of 0 leaves the simulation exactly as the controls describe it
+    // and 1 hands the parameter over entirely — monotone in Strength for every
+    // target, which the old single `mask_factor` was not.
+    let mask_value = mask_value_at(x, y);
+    let mask_weight = mask_blend();
+
     // Apply mask to parameters based on target
     var effective_sensor_distance = sim_size.agent_sensor_distance;
     var effective_speed = speed;
     var effective_turn_rate = sim_size.agent_turn_rate;
     var effective_deposition_rate = sim_size.pheromone_deposition_rate;
-    
+
     if (sim_size.mask_target == 0u) { // PheromoneDeposition (0..100)
         let target_min = 0.0;
         let target_max = 100.0;
-        let target_value = mix(target_min, target_max, mask_factor);
-        effective_deposition_rate = mix(effective_deposition_rate, target_value, mask_factor);
+        let target_value = mix(target_min, target_max, mask_value);
+        effective_deposition_rate = mix(effective_deposition_rate, target_value, mask_weight);
     } else if (sim_size.mask_target == 3u) { // AgentSpeed (normalize within min/max)
         let speed_min = sim_size.agent_speed_min;
         let speed_max = sim_size.agent_speed_max;
         let speed_norm = clamp((effective_speed - speed_min) / max(0.0001, speed_max - speed_min), 0.0, 1.0);
-        let target_norm = mask_factor; // 0..1 in normalized space
-        let mixed_norm = mix(speed_norm, target_norm, mask_factor);
+        let target_norm = mask_value; // 0..1 in normalized space
+        let mixed_norm = mix(speed_norm, target_norm, mask_weight);
         effective_speed = speed_min + mixed_norm * (speed_max - speed_min);
     } else if (sim_size.mask_target == 4u) { // AgentTurnRate (0..pi)
         let target_min = 0.0;
         let target_max = 3.14159265;
-        let target_value = mix(target_min, target_max, mask_factor);
-        effective_turn_rate = mix(effective_turn_rate, target_value, mask_factor);
+        let target_value = mix(target_min, target_max, mask_value);
+        effective_turn_rate = mix(effective_turn_rate, target_value, mask_weight);
     } else if (sim_size.mask_target == 5u) { // AgentSensorDistance (0..500 per UI)
         let target_min = 0.0;
         let target_max = 500.0;
-        let target_value = mix(target_min, target_max, mask_factor);
-        effective_sensor_distance = mix(effective_sensor_distance, target_value, mask_factor);
+        let target_value = mix(target_min, target_max, mask_value);
+        effective_sensor_distance = mix(effective_sensor_distance, target_value, mask_weight);
     } else if (sim_size.mask_target == 6u) { // TrailMap (direct trail map modification)
         // For TrailMap target, we'll apply the mask factor directly to the deposition rate
         // This allows the mask to control how much pheromone is deposited in different areas
         // Make the effect more pronounced by using a wider range
         let min_deposition = 0.0;
         let max_deposition = effective_deposition_rate * 2.0;
-        effective_deposition_rate = mix(min_deposition, max_deposition, mask_factor);
+        let target_value = mix(min_deposition, max_deposition, mask_value);
+        effective_deposition_rate = mix(effective_deposition_rate, target_value, mask_weight);
     }
 
     // Sample trail map at sensor positions
@@ -352,24 +398,28 @@ fn decay_trail(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let idx = y * sim_size.width + x;
     
-    // Get mask factor for this position, apply curve and strength
-    var mask_factor = get_mask_factor(f32(x), f32(y));
-    mask_factor = pow(clamp(mask_factor, 0.0, 1.0), max(0.0001, sim_size.mask_curve));
-    mask_factor = clamp(mask_factor * sim_size.mask_strength, 0.0, 1.0);
-    
+    // The mask's shaped pattern value here, and its blend weight; see
+    // `mask_value_at` / `mask_blend`.
+    let mask_value = mask_value_at(f32(x), f32(y));
+    let mask_weight = mask_blend();
+
     // Apply mask to decay rate if target is PheromoneDecay
     var effective_decay_rate = sim_size.decay_rate;
     if (sim_size.mask_target == 1u) { // PheromoneDecay (0..10000)
         let target_min = 0.0;
         let target_max = 10000.0;
-        let target_value = mix(target_min, target_max, mask_factor);
-        effective_decay_rate = mix(effective_decay_rate, target_value, 1.0);
+        let target_value = mix(target_min, target_max, mask_value);
+        // Weighted by the mask, not by a hardcoded 1.0. That literal made this
+        // an unconditional *override* — `mix(a, b, 1.0)` is just `b` — so the
+        // authored decay rate was discarded wherever the mask was dark, and a
+        // Disabled pattern (mask 0 everywhere) pinned the effective decay rate
+        // to 0 and saturated the whole field to a solid mat. Reachable by
+        // ordinary use: pick this target, then set the pattern to Disabled, at
+        // which point the target selector hides but the value persists.
+        effective_decay_rate = mix(effective_decay_rate, target_value, mask_weight);
     } else if (sim_size.mask_target == 6u) { // TrailMap (direct trail map modification)
-        // Blend trail toward mask pattern each pass for a clear effect
-        // Use mask_strength as the blend factor, shaped by mask_curve
-        let blend = clamp(sim_size.mask_strength, 0.0, 1.0);
-        let target_trail = mask_factor; // 0..1 from pattern/image
-        trail_map[idx] = mix(trail_map[idx], target_trail, blend);
+        // Blend trail toward the mask pattern each pass for a clear effect.
+        trail_map[idx] = mix(trail_map[idx], mask_value, mask_weight);
     }
     
     // Apply decay rate
@@ -387,16 +437,22 @@ fn diffuse_trail(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let idx = y * sim_size.width + x;
     
-    // Get mask factor for this position
-    let mask_factor = get_mask_factor(f32(x), f32(y));
-    
+    // The mask's shaped pattern value here, and its blend weight. This pass
+    // used to read the raw mask and apply neither `mask_curve` nor
+    // `mask_strength`, so the Diffusion target ignored both controls outright.
+    let mask_value = mask_value_at(f32(x), f32(y));
+    let mask_weight = mask_blend();
+
     // Apply mask to diffusion rate if target is PheromoneDiffusion
     var effective_diffusion_rate = sim_size.diffusion_rate;
     if (sim_size.mask_target == 2u) { // PheromoneDiffusion (0..100)
         let target_min = 0.0;
         let target_max = 100.0;
-        let target_value = mix(target_min, target_max, mask_factor);
-        effective_diffusion_rate = mix(effective_diffusion_rate, target_value, 1.0);
+        let target_value = mix(target_min, target_max, mask_value);
+        // Weighted, not the old hardcoded 1.0 — same override bug as the decay
+        // pass above, with the same Disabled-pattern consequence (diffusion
+        // pinned to 0, so trails never spread).
+        effective_diffusion_rate = mix(effective_diffusion_rate, target_value, mask_weight);
     }
     
     // Get neighboring values with toroidal wrapping

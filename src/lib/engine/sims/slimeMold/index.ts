@@ -1272,15 +1272,20 @@ export class SlimeMoldSimulation implements Simulation {
      * Three cases, and the middle one is a fix. The Rust gates the mask
      * dispatch on `pattern != Disabled && pattern != Image`
      * (simulation.rs:993), so switching *away* from a pattern leaves the old
-     * mask in the buffer — and `get_mask_factor` (compute.wgsl:149) is called
-     * unconditionally by all three kernels, with `update_agents` applying it
-     * through whichever `mask_target` branch is selected regardless of the
-     * pattern. **Disabling the mask therefore does not disable its effect on the
-     * desktop build.** `generate_mask` already writes 0.0 for both Disabled and
-     * Image (gradient.wgsl:54), so the fix is simply to run the pass for
-     * Disabled too and let the shader zero the buffer — which is also what makes
-     * the `Image` case safe to special-case, since running it there would erase
-     * the uploaded image.
+     * mask in the buffer — and the mask was sampled unconditionally by all three
+     * kernels, with `update_agents` applying it through whichever `mask_target`
+     * branch is selected regardless of the pattern. **Disabling the mask
+     * therefore does not disable its effect on the desktop build.**
+     * `generate_mask` already writes 0.0 for both Disabled and Image
+     * (gradient.wgsl:54), so the fix is simply to run the pass for Disabled too
+     * and let the shader zero the buffer — which is also what makes the `Image`
+     * case safe to special-case, since running it there would erase the uploaded
+     * image.
+     *
+     * `compute.wgsl` now belts-and-braces the same thing from the other side:
+     * `mask_value_at` / `mask_blend` return 0 for a Disabled pattern without
+     * reading `mask_map` at all, so a stale buffer cannot act even on a build
+     * that never ran this pass.
      *
      * Running it on a dirty flag rather than every frame is free: the mask is a
      * pure function of the uniform, so it changes only when the uniform does.

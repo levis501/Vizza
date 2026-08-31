@@ -22,13 +22,16 @@
  *    literal, not that it is minimal.
  *  - **"Default" carries no overrides at all** (mod.rs:21 —
  *    `Preset::new("Default", Settings::default())`), so it is `{}`.
- *  - **Six presets pin `pheromone_decay_rate: 100.0`** against a default of
- *    10.0. That is a 10x difference in how fast trails fade and it is the single
- *    most visible parameter in the simulation, so it is not optional garnish —
- *    the eight presets that omit it (Default, Firecracker Trees, Snake, Venom,
- *    plus Cells and Net which set their own) really do run at a different decay.
+ *  - **Seven presets pin `pheromone_decay_rate: 100.0`** — Gloop Loops,
+ *    Threads, Bars, Healthy Fungus, Sand On A Speaker, Spots, Cascades —
+ *    against a default of 10.0. That is a 10x difference in how fast trails fade
+ *    and it is the single most visible parameter in the simulation, so it is not
+ *    optional garnish: the other six really do run at a different decay (Cells
+ *    and Net set their own, at 30 and 400; Default, Firecracker Trees, Snake and
+ *    Venom omit it and inherit the 10.0). 7 + 2 + 4 = 13. **Counted, because the
+ *    number here used to say six against an eight that did not add up.**
  *
- * The six "Bars" … "Cascades" entries carry long decimal tails because they
+ * The five "Bars" … "Cascades" entries carry long decimal tails because they
  * were captured from the Randomize button and pasted in; `276.855_5` and
  * `0.733_131_2` in mod.rs are Rust digit separators, not extra precision.
  *

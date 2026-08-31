@@ -3468,10 +3468,13 @@ test('slime mold agent seeding is deterministic for a fixed seed', async () => {
  *
  * The Rust dispatches `generate_mask` only when the pattern is neither Disabled
  * nor Image (simulation.rs:993), so selecting Disabled leaves the previous
- * pattern sitting in `mask_map` — and `get_mask_factor` is read unconditionally
- * by all three field kernels, with `update_agents` applying it through whichever
+ * pattern sitting in `mask_map` — and the mask is read unconditionally by all
+ * three field kernels, with `update_agents` applying it through whichever
  * `mask_target` is selected regardless of the pattern. `generate_mask` already
  * writes 0.0 for Disabled (gradient.wgsl:54); the port simply runs it.
+ *
+ * The shader now refuses to read `mask_map` for a Disabled pattern as well, so
+ * this asserts the buffer *and* the test below asserts the behaviour.
  */
 test('disabling the slime mold mask actually clears it', async () => {
     const sim = await SlimeMoldSimulation.create(gpu, { agentCount: SLIME_AGENTS });
@@ -3499,6 +3502,270 @@ test('disabling the slime mold mask actually clears it', async () => {
 
     sim.destroy();
     target.destroy();
+});
+
+/** Everything the trail map holds, which is what a deposition change moves. */
+function total(values: Float32Array): number {
+    let sum = 0;
+    for (const value of values) sum += value;
+    return sum;
+}
+
+/** Overwrite the trail map wholesale, so a decay or diffusion test has a field. */
+function writeTrail(sim: SlimeMoldSimulation, values: Float32Array): void {
+    gpu.device.queue.writeBuffer(sim.trailStorage, 0, values);
+}
+
+/**
+ * Mask Strength has to change something — the M7 browser check's headline
+ * finding was that it changes nothing at the defaults.
+ *
+ * Two independent reasons, both fixed in `compute.wgsl`:
+ *
+ *  1. Strength was folded into the mask value *before* the target branches, so
+ *     the Pheromone Deposition branch came out `mix(dep, mix(0, 100, mf), mf)`
+ *     — quadratic in the mask. At the default deposition rate of 100, which is
+ *     simultaneously that branch's range maximum and the UI's own maximum, that
+ *     is `100·(1 − mf + mf²)`: exactly 100 at both mf = 0 and mf = 1, so on a
+ *     hard 0/1 pattern like Checkerboard the deposition rate was 100 at *every*
+ *     strength, and on a smooth one it could only dip 25% in the mid-tones.
+ *  2. The strength is now a blend weight and the branches are
+ *     `mix(authored, target, strength)`, which is monotone in it.
+ *
+ * The assertion is the monotonicity, not a number: three strengths, strictly
+ * decreasing deposit totals.
+ */
+test('slime mold mask Strength changes the parameter it targets', async () => {
+    // `generate_mask`'s Checkerboard block is a fixed **200 simulation pixels**
+    // (gradient.wgsl:71), so on the harness's 64x64 field the whole map is one
+    // block of 1.0 and a checkerboard is indistinguishable from a flat mask.
+    // 512 is the smallest round size with alternating blocks on both axes.
+    const FIELD = 512;
+    const AGENTS = 4096;
+
+    async function depositTotalAtStrength(strength: number): Promise<number> {
+        const sim = await SlimeMoldSimulation.create(gpu, { agentCount: AGENTS });
+        const [target, view] = renderTarget(32, `slime mold mask strength ${strength}`);
+
+        sim.resize(FIELD, FIELD);
+        const [w, h] = sim.fieldSize;
+        assert(w === FIELD && h === FIELD, `the field came out ${w}x${h}, not ${FIELD} square`);
+
+        sim.updateState('mask_pattern', 'Checkerboard');
+        // The default target, which is the configuration the user was in.
+        sim.updateState('mask_target', 'Pheromone Deposition');
+        sim.updateState('mask_curve', 1);
+        sim.updateState('mask_strength', strength);
+
+        // A fixed seed and a blank field, so strength is the only difference
+        // between the three runs. `resize` re-seeds the trail map with noise,
+        // hence the clear after it rather than before.
+        sim.resetAgents(0x51e1);
+        sim.resetRuntimeState();
+
+        sim.renderFrame(view, 1 / 60);
+        const trail = await readTrail(sim);
+
+        sim.destroy();
+        target.destroy();
+        return total(trail);
+    }
+
+    const off = await depositTotalAtStrength(0);
+    const half = await depositTotalAtStrength(0.5);
+    const full = await depositTotalAtStrength(1);
+
+    // At strength 0 every agent deposits at the authored rate of 100, which
+    // saturates its cell in one pass, so the total is essentially the occupied
+    // cell count. Checkerboard leaves about 52% of a 512-square field bright.
+    assert(
+        off > AGENTS * 0.8,
+        `strength 0 should deposit at the authored rate everywhere, total was ${off.toFixed(0)}`
+    );
+    assert(
+        off > half * 1.15,
+        `strength 0.5 deposited as much as strength 0 (${half.toFixed(0)} vs ${off.toFixed(0)}) ` +
+            `— the Strength control is not reaching the deposition rate`
+    );
+    assert(
+        half > full * 1.15,
+        `strength 1 deposited as much as strength 0.5 (${full.toFixed(0)} vs ${half.toFixed(0)})`
+    );
+    assert(
+        off - full > off * 0.3,
+        `sweeping Strength 0 to 1 moved the deposit total by only ` +
+            `${(((off - full) / off) * 100).toFixed(1)}%`
+    );
+});
+
+/**
+ * The route the mask is actually *visible* through, and the one that used to
+ * ignore Strength and Curve outright.
+ *
+ * `sample_combined_map` / `_fast` returned `trail + raw_mask`. The agents'
+ * sensors read that, so a mask acts as phantom pheromone and agents pile into
+ * its bright regions — at a million agents that is the dominant thing the mask
+ * does on screen, and it was structurally deaf to both controls. Only
+ * `get_mask_factor`'s consumers applied them.
+ *
+ * With the trail map held at exactly zero, both sensors read the mask alone, so
+ * a strength of 0 must leave *every* heading untouched and a strength of 1 must
+ * turn nearly all of them.
+ */
+test('the slime mold mask reaches the agent sensors only as strongly as Strength says', async () => {
+    const AGENTS = 512;
+
+    async function agentsTurnedAtStrength(strength: number): Promise<number> {
+        const sim = await SlimeMoldSimulation.create(gpu, { agentCount: AGENTS });
+        const [target, view] = renderTarget(32, `slime mold sensor strength ${strength}`);
+
+        // Radial Gradient rather than Checkerboard: it varies across the 64x64
+        // field, where the checkerboard's 200-pixel block does not.
+        sim.updateState('mask_pattern', 'Radial Gradient');
+        // Pheromone Decay is the one target with **no branch in
+        // `update_agents`** (its arms are 0, 3, 4, 5 and 6), so the only path
+        // from the mask into a heading is the sensor sampler under test.
+        sim.updateState('mask_target', 'Pheromone Decay');
+        sim.updateState('mask_curve', 1);
+        sim.updateState('mask_strength', strength);
+        // No deposits, so the trail map stays exactly zero and the two sensor
+        // readings are exactly the mask. Without this an agent's own deposit
+        // breaks a tie and the strength-0 run turns a handful by luck, which
+        // would cost the assertion its exactness.
+        sim.updateSetting('pheromone_deposition_rate', 0);
+
+        sim.resetAgents(0x5e50);
+        sim.resetRuntimeState();
+
+        const before = await readAgents(sim);
+        sim.renderFrame(view, 1 / 60);
+        const after = await readAgents(sim);
+
+        sim.destroy();
+        target.destroy();
+
+        let turned = 0;
+        // Word 2 of each agent is its heading; position and speed move anyway.
+        for (let i = 2; i < before.length; i += 4) {
+            if (before[i] !== after[i]) turned++;
+        }
+        return turned;
+    }
+
+    const off = await agentsTurnedAtStrength(0);
+    assert(
+        off === 0,
+        `${off} of ${AGENTS} agents steered off a mask at strength 0 — the sensors are reading ` +
+            `the mask regardless of the control`
+    );
+
+    const on = await agentsTurnedAtStrength(1);
+    assert(on > AGENTS * 0.9, `only ${on} of ${AGENTS} agents steered off the mask at strength 1`);
+});
+
+/**
+ * A Disabled pattern has to disable the mask, whatever the Mask Target still
+ * says.
+ *
+ * `decay_trail` and `diffuse_trail` blended with a hardcoded weight of `1.0` —
+ * and `mix(a, b, 1.0)` is just `b`, so the branch was an unconditional
+ * *override* rather than a mask. With the pattern Disabled the mask is 0
+ * everywhere, so the target value was `mix(0, 10000, 0) = 0` and the effective
+ * decay rate was pinned to **zero**: the trail map saturated to a solid mat and
+ * never came back. Diffusion behaved the same way, pinned to no spreading at
+ * all.
+ *
+ * Reachable by ordinary use, which is why it is worth a test: the Mask Target
+ * selector is hidden while the pattern is Disabled (SlimeMoldMode.svelte:380)
+ * but the state value persists, so picking a target and then switching the
+ * pattern off is enough.
+ */
+test('a Disabled slime mold mask cannot be revived by a stale Mask Target', async () => {
+    // --- decay --------------------------------------------------------------
+    async function meanAfterDecay(target: string): Promise<number> {
+        const sim = await SlimeMoldSimulation.create(gpu, { agentCount: 1 });
+        const [texture, view] = renderTarget(32, `slime mold stale decay ${target}`);
+
+        sim.updateState('mask_pattern', 'Checkerboard');
+        sim.updateState('mask_target', target);
+        sim.updateState('mask_pattern', 'Disabled');
+        // 1000 * 0.0001 = 0.1 a pass, so ten passes clear a saturated field —
+        // large enough that "did it decay at all" is not a tolerance question.
+        sim.updateSetting('pheromone_decay_rate', 1000);
+        sim.updateSetting('pheromone_deposition_rate', 0);
+        sim.updateSetting('pheromone_diffusion_rate', 0);
+        sim.resetAgents(1);
+
+        const [w, h] = sim.fieldSize;
+        writeTrail(sim, new Float32Array(w * h).fill(1));
+        for (let i = 0; i < 10; i++) sim.renderFrame(view, 1 / 60);
+        const trail = await readTrail(sim);
+
+        sim.destroy();
+        texture.destroy();
+        return mean(trail);
+    }
+
+    const stale = await meanAfterDecay('Pheromone Decay');
+    assert(
+        stale < 0.05,
+        `a saturated trail map sat at ${stale.toFixed(3)} after ten decay passes — the decay ` +
+            `rate is pinned by a mask that is switched off`
+    );
+    const untargeted = await meanAfterDecay('Pheromone Deposition');
+    assertClose(stale, untargeted, 0.01, 'a Disabled mask must make the Mask Target irrelevant');
+
+    // --- diffusion ----------------------------------------------------------
+    async function spreadAfterDiffusion(target: string): Promise<number> {
+        const sim = await SlimeMoldSimulation.create(gpu, { agentCount: 1 });
+        const [texture, view] = renderTarget(32, `slime mold stale diffusion ${target}`);
+
+        sim.updateState('mask_pattern', 'Checkerboard');
+        sim.updateState('mask_target', target);
+        sim.updateState('mask_pattern', 'Disabled');
+        sim.updateSetting('pheromone_decay_rate', 0);
+        sim.updateSetting('pheromone_deposition_rate', 0);
+        sim.resetAgents(1);
+
+        const [w, h] = sim.fieldSize;
+        // One bright block in the middle of an otherwise empty field.
+        const seeded = new Float32Array(w * h);
+        const half = 4;
+        for (let y = h / 2 - half; y < h / 2 + half; y++) {
+            for (let x = w / 2 - half; x < w / 2 + half; x++) seeded[y * w + x] = 1;
+        }
+        writeTrail(sim, seeded);
+
+        for (let i = 0; i < 20; i++) sim.renderFrame(view, 1 / 60);
+        const trail = await readTrail(sim);
+
+        sim.destroy();
+        texture.destroy();
+
+        // How much of the field the block reached, counted outside its own
+        // footprint so an unchanged block scores exactly zero.
+        let escaped = 0;
+        for (let i = 0; i < trail.length; i++) {
+            if (seeded[i] === 0 && trail[i] > 1e-4) escaped++;
+        }
+        return escaped;
+    }
+
+    const staleDiffusion = await spreadAfterDiffusion('Pheromone Diffusion');
+    // The pass is `new = mean(4 neighbours)` at the default rate of 100, so the
+    // block's support grows a cell a pass; twenty passes reach several hundred.
+    // The defect scores exactly 0 — the block does not move at all.
+    assert(
+        staleDiffusion > 200,
+        `the trail spread into only ${staleDiffusion} cells over twenty diffusion passes — ` +
+            `diffusion is pinned by a mask that is switched off`
+    );
+    const untargetedDiffusion = await spreadAfterDiffusion('Pheromone Deposition');
+    assert(
+        Math.abs(staleDiffusion - untargetedDiffusion) <= untargetedDiffusion * 0.02,
+        `a Disabled mask must make the Mask Target irrelevant: ${staleDiffusion} cells reached ` +
+            `with the Diffusion target against ${untargetedDiffusion} without it`
+    );
 });
 
 /**
