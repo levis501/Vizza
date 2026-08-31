@@ -33,6 +33,7 @@ import type { SimulationId } from '../../types';
 import type { PresetSettings } from '../PresetStore';
 import { GRAY_SCOTT_BUILTIN_PRESETS } from './grayScott';
 import { MOIRE_BUILTIN_PRESETS } from './moire';
+import { SLIME_MOLD_BUILTIN_PRESETS } from './slimeMold';
 import { VECTORS_BUILTIN_PRESETS } from './vectors';
 
 export interface BuiltinPreset {
@@ -77,3 +78,4 @@ export function clearBuiltinPresets(): void {
 registerBuiltinPresets('moire', MOIRE_BUILTIN_PRESETS);
 registerBuiltinPresets('gray_scott', GRAY_SCOTT_BUILTIN_PRESETS);
 registerBuiltinPresets('vectors', VECTORS_BUILTIN_PRESETS);
+registerBuiltinPresets('slime_mold', SLIME_MOLD_BUILTIN_PRESETS);

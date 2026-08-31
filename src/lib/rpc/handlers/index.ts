@@ -14,6 +14,7 @@ import { registerColorSchemeHandlers } from './colorSchemes';
 import { registerPresetHandlers } from './presets';
 import { registerImageHandlers } from './images';
 import { registerGradientHandlers } from './gradient';
+import { registerSlimeMoldHandlers } from './slimeMold';
 
 let installed = false;
 
@@ -28,6 +29,7 @@ export function installHandlers(): void {
     registerPresetHandlers();
     registerImageHandlers();
     registerGradientHandlers();
+    registerSlimeMoldHandlers();
 }
 
 export { setPointerCanvas };

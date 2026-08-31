@@ -165,10 +165,19 @@ var<workgroup> local_agents: array<vec4<f32>, 256>;
 @compute @workgroup_size(16, 16, 1)
 fn update_agents(
     @builtin(global_invocation_id) id: vec3<u32>,
-    @builtin(local_invocation_id) local_id: vec3<u32>
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>
 ) {
-    // Calculate linear agent index from 2D global invocation
-    let agents_per_row = 65535u * 16u; // Max workgroups per row * threads per workgroup row
+    // Calculate linear agent index from 2D global invocation.
+    //
+    // The row stride is the *dispatched* width, not a hardcoded 65535: the
+    // caller folds an oversized 1D dispatch as `x = min(total, max_per_dim)`,
+    // `y = ceil(total / max_per_dim)`, so x is only 65535 once the agent count
+    // passes 16.7 M. Below that a constant 65535 stride skipped 15 of every 16
+    // agents — at 1 M agents only 62,512 of them were ever updated, and at the
+    // desktop default of 10 M about 38% sat frozen. Reading `num_workgroups.x`
+    // makes the mapping dense for every dispatch shape the caller can produce.
+    let agents_per_row = num_workgroups.x * 16u;
     let agent_index = id.x + id.y * agents_per_row;
     
     // For consistent random seeding, create a sequential index (preserves old preset behavior)
@@ -416,9 +425,12 @@ fn diffuse_trail(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 @compute @workgroup_size(16, 16, 1)
-fn update_agent_speeds(@builtin(global_invocation_id) id: vec3<u32>) {
-    // Calculate linear agent index from 2D global invocation
-    let agents_per_row = 65535u * 16u; // Max workgroups per row * threads per workgroup row
+fn update_agent_speeds(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>
+) {
+    // Same dense 2D index as `update_agents`; see the comment there.
+    let agents_per_row = num_workgroups.x * 16u;
     let agent_index = id.x + id.y * agents_per_row;
     
     // Bounds check - exit if this thread doesn't correspond to a valid agent
@@ -551,11 +563,19 @@ fn generate_image_position(seed: u32, width: f32, height: f32) -> vec2<f32> {
 }
 
 @compute @workgroup_size(64, 1, 1)
-fn reset_agents(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn reset_agents(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>
+) {
     // With 2D dispatch and workgroup_size(64, 1, 1):
     // global_id.x = linear thread index across all workgroups
-    // global_id.y = second dimension for large dispatches  
-    let agent_index = global_id.x + global_id.y * 65535u * 64u;
+    // global_id.y = second dimension for large dispatches
+    //
+    // This one was already dense with the old hardcoded 65535 stride, because
+    // the fold makes x exactly 65535 whenever y > 1. It reads num_workgroups
+    // anyway so all three agent kernels state the same rule, and so the caller
+    // may fold against `maxComputeWorkgroupsPerDimension` rather than a literal.
+    let agent_index = global_id.x + global_id.y * num_workgroups.x * 64u;
     let total_agents = arrayLength(&agents);
     
     if (agent_index >= total_agents) {

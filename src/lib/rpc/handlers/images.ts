@@ -30,6 +30,17 @@ const IMAGE_COMMANDS: Record<string, string> = {
     // registry stub, so choosing a file in the "Image" vector-field type
     // resolved `null` and left the field on its neutral 0.5 constant.
     load_vectors_vector_field_image: 'vector_field',
+    // Slime Mold is the only simulation with *two* image inputs, which is why
+    // `loadImage` carries a slot at all (rpc/context.ts). The position image
+    // seeds agent start positions when the position generator is "Image"; the
+    // mask image drives whichever quantity `mask_target` names when the mask
+    // pattern is "Image". Both land as `array<f32>` planes in one shared
+    // storage buffer, and seeding is rejection sampling rather than a CDF — but
+    // they are consumed by different passes at different times, and because the
+    // buffer is shared a procedural mask would otherwise overwrite a loaded
+    // position image (see sims/slimeMold), so the slot is what keeps them apart.
+    load_slime_mold_position_image: 'position',
+    load_slime_mold_mask_image: 'mask',
 };
 
 /**

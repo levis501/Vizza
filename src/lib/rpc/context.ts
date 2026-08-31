@@ -6,11 +6,21 @@
  * `SimulationHost` provides the real implementation from M2 onward.
  */
 
-import type { CameraState } from '$lib/engine/types';
+import type { CameraState, Caps } from '$lib/engine/types';
 
 export interface EngineContext {
     /** The running simulation's id, or null on the menu. */
     currentSimulation(): string | null;
+
+    /**
+     * Ceilings derived from the limits the adapter actually granted.
+     *
+     * On the seam rather than inside a simulation because a *control* needs
+     * them before any simulation exists: Slime Mold's agent-count box has to
+     * clamp to `caps.slimeMoldAgents`, and a request above it does not fail
+     * politely — it loses the GPU device (WEB_PORT.md, "Buffer budget").
+     */
+    caps(): Caps;
 
     /** Construct and start a simulation, tearing down any current one. */
     start(simulationType: string): Promise<void>;
@@ -68,6 +78,30 @@ export interface EngineContext {
      * one with the button today.
      */
     seedRandomNoise(seed?: number): void;
+
+    /**
+     * Re-seed the agent pool. Slime Mold's "Reset Agents"; a no-op elsewhere.
+     *
+     * Distinct from `resetSimulation()` and from `resetRuntimeState()` for the
+     * same reason those two are distinct from each other — Slime Mold's UI
+     * offers *both* "Clear Trails" (its `resetRuntimeState`; the Rust routes
+     * `reset_runtime_state` straight to `reset_trails`, simulation.rs:2766) and
+     * "Reset Agents", and the ButtonSelect fires them together. Collapsing them
+     * would make one of the two buttons a no-op with nothing to show for it.
+     */
+    resetAgents(): void;
+
+    /**
+     * Resize the agent pool.
+     *
+     * Not `updateSetting('agent_count')`: the count is not a `Settings` field
+     * on either side — the Rust holds it on the model and `get_state` folds it
+     * into the state document — and it is not a plain state write either, since
+     * changing it reallocates the storage buffer and rebuilds bind groups
+     * (simulation.rs:1485). Callers must clamp first; see
+     * `clampSlimeMoldAgentCount`.
+     */
+    setAgentCount(count: number): void;
 
     randomizeSettings(): void;
     updateColorScheme(lut: Uint32Array, reversed: boolean): void;

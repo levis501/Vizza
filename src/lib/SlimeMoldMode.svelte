@@ -10,7 +10,7 @@
     on:toggleUI={toggleBackendGui}
     on:pause={stopSimulation}
     on:resume={resumeSimulation}
-    on:userInteraction={() => autoHideManager.handleUserInteraction()}
+    on:userInteraction={() => autoHideManager?.handleUserInteraction()}
     on:mouseEvent={handleMouseEvent}
 >
     {#if settings && state}
@@ -120,48 +120,11 @@
                         >
                         <ButtonSelect
                             value={state.position_generator}
-                            options={[
-                                { value: 'Random', label: 'Random', buttonAction: 'randomize' },
-                                { value: 'Center', label: 'Center', buttonAction: 'randomize' },
-                                {
-                                    value: 'UniformCircle',
-                                    label: 'Uniform Circle',
-                                    buttonAction: 'randomize',
-                                },
-                                {
-                                    value: 'CenteredCircle',
-                                    label: 'Centered Circle',
-                                    buttonAction: 'randomize',
-                                },
-                                { value: 'Ring', label: 'Ring', buttonAction: 'randomize' },
-                                { value: 'Line', label: 'Line', buttonAction: 'randomize' },
-                                { value: 'Spiral', label: 'Spiral', buttonAction: 'randomize' },
-                                { value: 'Image', label: 'Image', buttonAction: 'randomize' },
-                            ]}
+                            options={position_generator_options}
                             buttonText="Reset Agents"
                             placeholder="Select position generator..."
-                            on:change={async (e) => {
-                                if (state) {
-                                    state.position_generator = e.detail.value;
-                                    try {
-                                        await invoke('update_simulation_state', {
-                                            stateName: 'position_generator',
-                                            value: e.detail.value,
-                                        });
-                                    } catch (err) {
-                                        console.error('Failed to update position generator:', err);
-                                    }
-                                }
-                            }}
-                            on:buttonclick={async () => {
-                                try {
-                                    await invoke('reset_agents');
-                                    await invoke('reset_trails');
-                                    console.log('Agents randomized via ButtonSelect');
-                                } catch (err) {
-                                    console.error('Failed to randomize agents:', err);
-                                }
-                            }}
+                            on:change={({ detail }) => updatePositionGenerator(detail.value)}
+                            on:buttonclick={resetAgents}
                         />
                     </div>
 
@@ -173,23 +136,7 @@
                                 loadCommand="load_slime_mold_position_image"
                                 showFitMode={true}
                                 showLoadButton={true}
-                                onFitModeChange={async (
-                                    value: string
-                                ) => {
-                                    if (settings) {
-                                        settings.position_image_fit_mode = value;
-                                        try {
-                                            await invoke('set_slime_mold_position_image_fit_mode', {
-                                                fitMode: value,
-                                            });
-                                        } catch (err) {
-                                            console.error(
-                                                'Failed to update position image fit mode:',
-                                                err
-                                            );
-                                        }
-                                    }
-                                }}
+                                onFitModeChange={(value) => updatePositionImageFitMode(value)}
                             />
                         </div>
                     {/if}
@@ -290,17 +237,10 @@
                                 >Agent Count (millions):</label
                             >
                             <AgentCountInput
+                                id="sm-agent-count"
                                 value={agent_count_millions}
-                                min={0}
-                                max={100}
-                                on:update={async (e) => {
-                                    try {
-                                        await updateAgentCount(e.detail);
-                                        console.log(`Agent count updated to ${e.detail} million`);
-                                    } catch (err) {
-                                        console.error('Failed to update agent count:', err);
-                                    }
-                                }}
+                                maxAgents={agent_count_cap}
+                                on:update={({ detail }) => updateAgentCount(detail)}
                             />
                         </div>
                         <div class="setting-item">
@@ -352,24 +292,13 @@
                             <NumberDragBox
                                 id="sm-turn-rate"
                                 value={(settings.agent_turn_rate * 180) / Math.PI}
-                                on:change={({ detail }) =>
-                                    (settings!.agent_turn_rate = (detail * Math.PI) / 180)}
                                 min={0}
                                 max={360}
                                 step={1}
                                 precision={0}
                                 unit="°"
-                                on:change={async (e) => {
-                                    try {
-                                        await invoke('update_simulation_setting', {
-                                            settingName: 'agent_turn_rate',
-                                            value: (e.detail * Math.PI) / 180, // Convert degrees to radians
-                                        });
-                                        await syncSettingsFromBackend();
-                                    } catch (err) {
-                                        console.error('Failed to update turn rate:', err);
-                                    }
-                                }}
+                                on:change={({ detail }) =>
+                                    setRadians('agent_turn_rate', detail, 'turn rate')}
                             />
                         </div>
                         <div class="setting-item">
@@ -399,24 +328,13 @@
                             <NumberDragBox
                                 id="sm-sensor-angle"
                                 value={(settings.agent_sensor_angle * 180) / Math.PI}
-                                on:change={({ detail }) =>
-                                    (settings!.agent_sensor_angle = (detail * Math.PI) / 180)}
                                 min={0}
                                 max={180}
                                 step={1}
                                 precision={0}
                                 unit="°"
-                                on:change={async (e) => {
-                                    try {
-                                        await invoke('update_simulation_setting', {
-                                            settingName: 'agent_sensor_angle',
-                                            value: (e.detail * Math.PI) / 180, // Convert degrees to radians
-                                        });
-                                        await syncSettingsFromBackend();
-                                    } catch (err) {
-                                        console.error('Failed to update sensor angle:', err);
-                                    }
-                                }}
+                                on:change={({ detail }) =>
+                                    setRadians('agent_sensor_angle', detail, 'sensor angle')}
                             />
                         </div>
                         <div class="setting-item">
@@ -454,37 +372,19 @@
                             <label class="setting-label" for="sm-mask-pattern">Mask Pattern:</label>
                             <Selector
                                 id="sm-mask-pattern"
-                                options={[
-                                    'Disabled',
-                                    'Checkerboard',
-                                    'Diagonal Gradient',
-                                    'Radial Gradient',
-                                    'Vertical Stripes',
-                                    'Horizontal Stripes',
-                                    'Wave Function',
-                                    'Cosine Grid',
-                                    'Image',
-                                ]}
+                                options={mask_pattern_options}
                                 value={state.mask_pattern}
                                 on:change={handleMaskPattern}
                             />
                         </div>
-                        {#if state.mask_pattern !== 'Disabled'}
+                        {#if state.mask_pattern && state.mask_pattern !== 'Disabled'}
                             <div class="setting-item">
                                 <label class="setting-label" for="sm-mask-target"
                                     >Mask Target:</label
                                 >
                                 <Selector
                                     id="sm-mask-target"
-                                    options={[
-                                        'Pheromone Deposition',
-                                        'Pheromone Decay',
-                                        'Pheromone Diffusion',
-                                        'Agent Speed',
-                                        'Agent Turn Rate',
-                                        'Agent Sensor Distance',
-                                        'Trail Map',
-                                    ]}
+                                    options={mask_target_options}
                                     value={state.mask_target}
                                     on:change={handleMaskTarget}
                                 />
@@ -582,29 +482,26 @@
                                 <ImageSelector
                                     fitMode={state.mask_image_fit_mode}
                                     loadCommand="load_slime_mold_mask_image"
-                                    onFitModeChange={async (value) => {
-                                        if (state) {
-                                            state.mask_image_fit_mode = value as
-                                                | 'Stretch'
-                                                | 'Center'
-                                                | 'FitH'
-                                                | 'FitV';
-                                            try {
-                                                await invoke('set_slime_mold_mask_image_fit_mode', {
-                                                    fitMode: value,
-                                                });
-                                            } catch (err) {
-                                                console.error('Failed to update fit mode:', err);
-                                            }
-                                        }
-                                    }}
+                                    onFitModeChange={(value) => updateMaskImageFitMode(value)}
                                 />
-                                <WebcamControls
-                                    {webcamDevices}
-                                    {webcamActive}
-                                    onStartWebcam={startWebcamCapture}
-                                    onStopWebcam={stopWebcamCapture}
-                                />
+                                <!--
+                                    No WebcamControls here. Webcam is an
+                                    explicitly omitted feature of the browser
+                                    port (WEB_PORT.md, "Omitted features"), so
+                                    `get_available_webcam_devices` returns []
+                                    forever and the Start button rendered
+                                    permanently greyed out — a control
+                                    advertising a capability the app does not
+                                    have. Removed rather than disabled, as M4
+                                    did for Gray-Scott and M5 for Vectors.
+
+                                    Note this mode's enumeration command is the
+                                    *unprefixed* `get_available_webcam_devices`
+                                    (commands/slime_mold.rs:210). The name looks
+                                    shared; it is not — Flow and Moiré have
+                                    their own prefixed ones — so its stub is
+                                    gone from registry.ts with the panel.
+                                -->
                             {/if}
                         {/if}
                     </div>
@@ -633,7 +530,17 @@
     import NumberDragBox from './components/inputs/NumberDragBox.svelte';
     import Selector from './components/inputs/Selector.svelte';
     import ImageSelector from './components/shared/ImageSelector.svelte';
-    import WebcamControls from './components/shared/WebcamControls.svelte';
+    import {
+        clampSlimeMoldAgentCount,
+        MASK_PATTERNS,
+        MASK_TARGETS,
+        POSITION_GENERATORS,
+        SLIME_MOLD_DEFAULT_AGENTS,
+        type MaskPattern,
+        type MaskTarget,
+        type PositionGenerator,
+    } from '$lib/engine/sims/slimeMold/settings';
+    import { SPEC_MINIMUM_SLIME_MOLD_AGENTS } from '$lib/engine/gpu/limits';
     import { AutoHideManager, createAutoHideEventListeners } from './utils/autoHide';
     import { createSyncManager } from './utils/sync';
     import './shared-theme.css';
@@ -668,31 +575,26 @@
         decay_frequency: number;
         random_seed: number;
 
-        // Background mode
-        background_mode: 'black' | 'white';
+        /**
+         * `"Black"` / `"White"`, not the lowercase this used to claim.
+         *
+         * Three spellings exist (settings.rs:75): serde's capitalised pair,
+         * which is what `get_settings` emits and what a preset carries;
+         * `as_str()`'s lowercase pair; and
+         * `update_slime_mold_background_mode`'s lowercase match arm. Nothing in
+         * this menu renders the field, so the lie was invisible — but the
+         * engine's `BACKGROUND_MODES` is the serde spelling, so this is now the
+         * same string on both sides.
+         */
+        background_mode: 'Black' | 'White';
     };
 
-    // State type (matches src-tauri/src/simulations/slime_mold/state.rs)
+    // State type (matches src-tauri/src/simulations/slime_mold/state.rs, plus
+    // the three model-level fields get_state folds in — see SlimeMoldState).
     type State = {
         // Mask system state
-        mask_pattern:
-            | 'Disabled'
-            | 'Checkerboard'
-            | 'Diagonal Gradient'
-            | 'Radial Gradient'
-            | 'Vertical Stripes'
-            | 'Horizontal Stripes'
-            | 'Wave Function'
-            | 'Cosine Grid'
-            | 'Image';
-        mask_target:
-            | 'Pheromone Deposition'
-            | 'Pheromone Decay'
-            | 'Pheromone Diffusion'
-            | 'Agent Speed'
-            | 'Agent Turn Rate'
-            | 'Agent Sensor Distance'
-            | 'Trail Map';
+        mask_pattern: MaskPattern;
+        mask_target: MaskTarget;
         mask_strength: number;
         mask_curve: number;
         mask_reversed: boolean;
@@ -710,7 +612,11 @@
         cursor_strength: number;
 
         // Position generator
-        position_generator: string;
+        position_generator: PositionGenerator;
+
+        // Agent pool size. Not a Settings field on either side: the Rust holds
+        // it on the model (simulation.rs:133) and get_state folds it in.
+        agent_count: number;
 
         // UI visibility state
         gui_visible: boolean;
@@ -731,8 +637,45 @@
     // Create sync manager for type-safe backend synchronization
     const syncManager = createSyncManager<Settings, State>();
 
+    /**
+     * The three option lists, taken from the engine rather than retyped.
+     *
+     * They have to be *character-identical* to what `get_current_state` returns
+     * — `Selector.svelte` compares with `options.includes(value)` and
+     * `ButtonSelect` renders `<option value=…>` — and two of the three were
+     * not. `MaskPattern`/`MaskTarget` happened to agree here (`get_state` emits
+     * `as_str()`, which is the display spelling, so unlike Gray-Scott this pair
+     * was already correct), but the position generator listed *serde's*
+     * spelling: `'UniformCircle'` against the `'Uniform Circle'` the backend
+     * both emits and accepts. After any state sync that select fell back to its
+     * placeholder, and the value it sent parsed as nothing — which on the
+     * desktop means `from_str` returns None and the generator silently resets
+     * to Random (position_generators.rs:155, simulation.rs:1450).
+     *
+     * Importing is what stops the two copies drifting again, exactly as
+     * `GrayScottMode` does since M4.
+     */
+    const mask_pattern_options: string[] = [...MASK_PATTERNS];
+    const mask_target_options: string[] = [...MASK_TARGETS];
+    const position_generator_options = POSITION_GENERATORS.map((name) => ({
+        value: name,
+        label: name,
+        buttonAction: 'randomize',
+    }));
+
     // Agent count tracked separately (not part of preset settings)
-    let currentAgentCount = 1_000_000;
+    let currentAgentCount = SLIME_MOLD_DEFAULT_AGENTS;
+
+    /**
+     * The device ceiling, in agents.
+     *
+     * Fetched rather than constant: it is derived from the granted
+     * `maxStorageBufferBindingSize` (gpu/limits.ts), so only the engine knows
+     * it. The initial value is the ceiling every conformant implementation must
+     * honour, which is the honest answer for the tick before the reply lands
+     * and the permanent answer on a browser with no WebGPU at all.
+     */
+    let agent_count_cap = SPEC_MINIMUM_SLIME_MOLD_AGENTS;
 
     // Preset and color scheme state
     let current_preset = '';
@@ -761,9 +704,17 @@
     let isMousePressed = false;
     let currentMouseButton = 0;
 
-    // Webcam state
-    let webcamDevices: number[] = [];
-    let webcamActive = false;
+    /**
+     * Set by `onDestroy`, checked by everything that resumes after an `await`.
+     *
+     * `onMount` here is one long await chain — start, presets, colour schemes,
+     * three syncs — and `listen('fps-update')` is at the end of it. Navigating
+     * away before that resolves used to register the listener *after* teardown
+     * had run, so it was never unsubscribed and went on writing `currentFps`
+     * into a destroyed component for the life of the page. M6 found the same
+     * class of bug in the gradient editor's debounced preview.
+     */
+    let destroyed = false;
 
     async function returnToMenu() {
         try {
@@ -828,38 +779,51 @@
         }
     }
 
-    // Helper function to convert agent count to millions
+    // Helper function to convert agent count to millions.
+    // `fromMillions` rounds: 3.774873 * 1e6 is 3774872.9999999995 in binary
+    // floating point, and the clamp floors, so a bare multiply loses one agent
+    // on every trip through the box.
     const toMillions = (count: number) => count / 1_000_000;
-    const fromMillions = (millions: number) => millions * 1_000_000;
+    const fromMillions = (millions: number) => Math.round(millions * 1_000_000);
 
     // Computed values
     $: agent_count_millions = toMillions(currentAgentCount);
 
-    // Two-way binding handlers
-    async function updateAgentCount(value: number) {
-        const newCount = fromMillions(value);
-        console.log('Updating agent count: input =', value, 'millions, actual count =', newCount);
+    /**
+     * The clamp happens three times and each one earns its place.
+     *
+     * `AgentCountInput` clamps so the user is *told* what happened, this clamps
+     * so nothing that bypasses the control (a restored value, a future preset)
+     * reaches the command, and `handlers/slimeMold.ts` clamps because it is the
+     * last thing before a `createBuffer` that would otherwise lose the device.
+     */
+    async function updateAgentCount(millions: number) {
+        const requested = clampSlimeMoldAgentCount(fromMillions(millions), agent_count_cap);
         try {
-            await invoke('update_agent_count', { count: newCount });
-            console.log('Backend update completed, syncing from backend...');
-            // Sync the actual agent count from backend
+            await invoke('update_agent_count', { count: requested });
             await syncAgentCountFromBackend();
-            console.log('Sync completed, currentAgentCount is now:', currentAgentCount);
         } catch (e) {
             console.error('Failed to update agent count:', e);
         }
     }
 
+    /**
+     * Reverse the colour scheme through the colour-scheme command, not through
+     * a bare state write.
+     *
+     * `update_simulation_state('color_scheme_reversed')` puts the flag in the
+     * state document but pushes no LUT: the bytes live in `ColorSchemeManager`
+     * and only `toggle_color_scheme_reversed` re-derives and hands them to the
+     * simulation (handlers/colorSchemes.ts). So the checkbox moved and the
+     * picture did not. Same shape as the `updateLutName` defect below.
+     */
     async function updateLutReversed() {
-        if (!state) return;
-        const newValue = !state.color_scheme_reversed;
-        const result = await syncManager.updateStateOptimistic(
-            state,
-            'color_scheme_reversed',
-            newValue,
-            true // sync from backend after update
-        );
-        if (result) state = result;
+        try {
+            await invoke('toggle_color_scheme_reversed');
+            await syncAllFromBackend();
+        } catch (e) {
+            console.error('Failed to toggle color scheme reversed:', e);
+        }
     }
 
     // Cursor configuration handlers
@@ -955,6 +919,92 @@
         }
     }
 
+    /**
+     * The two angle boxes show degrees and the backend stores radians.
+     *
+     * They used to carry *two* `on:change` directives — one converting into
+     * `settings!` and one invoking — which Svelte runs both of, so it worked,
+     * but the conversion was written twice with only the comment to say the
+     * two constants had to agree. One handler, one conversion.
+     */
+    async function setRadians(
+        name: 'agent_turn_rate' | 'agent_sensor_angle',
+        degrees: number,
+        label: string
+    ) {
+        if (!settings) return;
+        const radians = (degrees * Math.PI) / 180;
+        settings = { ...settings, [name]: radians };
+        try {
+            await invoke('update_simulation_setting', { settingName: name, value: radians });
+            await syncSettingsFromBackend();
+        } catch (err) {
+            console.error(`Failed to update ${label}:`, err);
+        }
+    }
+
+    /**
+     * `update_simulation_state`, deliberately, though the Rust has no such arm.
+     *
+     * On the desktop this select reaches `update_state`'s `_ =>` fallback,
+     * which warns and returns `Ok(())` (simulation.rs:2630) — so the whole
+     * "Agent Position Generator" control does nothing, every reset re-seeds
+     * with `Random`, and the Image generator (with its own file picker and fit
+     * mode) is unreachable. The generator *is* in `update_setting`, but it is
+     * not a `Settings` field: `get_settings` never returns it and `get_state`
+     * does. The port puts the write where the read is, and
+     * `updateSlimeMoldState` has the matching arm.
+     */
+    async function updatePositionGenerator(value: string) {
+        if (!state) return;
+        state = { ...state, position_generator: value as PositionGenerator };
+        try {
+            await invoke('update_simulation_state', {
+                stateName: 'position_generator',
+                value,
+            });
+        } catch (err) {
+            console.error('Failed to update position generator:', err);
+        }
+    }
+
+    /** "Reset Agents" re-seeds the pool *and* blanks the trails it left. */
+    async function resetAgents() {
+        try {
+            await invoke('reset_agents');
+            await invoke('reset_trails');
+        } catch (err) {
+            console.error('Failed to reset agents:', err);
+        }
+    }
+
+    /**
+     * The two fit modes go to different documents because that is where the two
+     * fields live — see `handlers/slimeMold.ts`. Both keep their dedicated
+     * command rather than being folded into `update_simulation_setting`,
+     * because each has to re-fit an *already decoded* image, which the plain
+     * setter has no reason to do.
+     */
+    async function updatePositionImageFitMode(value: string) {
+        if (!settings) return;
+        settings = { ...settings, position_image_fit_mode: value };
+        try {
+            await invoke('set_slime_mold_position_image_fit_mode', { fitMode: value });
+        } catch (err) {
+            console.error('Failed to update position image fit mode:', err);
+        }
+    }
+
+    async function updateMaskImageFitMode(value: string) {
+        if (!state) return;
+        state = { ...state, mask_image_fit_mode: value };
+        try {
+            await invoke('set_slime_mold_mask_image_fit_mode', { fitMode: value });
+        } catch (err) {
+            console.error('Failed to update mask image fit mode:', err);
+        }
+    }
+
     async function updatePreset(value: string) {
         current_preset = value;
         try {
@@ -1011,58 +1061,64 @@
     // Sync settings from backend to frontend
     async function syncSettingsFromBackend() {
         const synced = await syncManager.syncSettings();
-        if (synced) settings = synced;
+        if (synced && !destroyed) settings = synced;
     }
 
     // Sync state from backend to frontend
     async function syncStateFromBackend() {
         const synced = await syncManager.syncState();
-        if (synced) state = synced;
+        if (synced && !destroyed) state = synced;
     }
 
-    // Sync agent count separately from settings
+    async function syncAllFromBackend() {
+        const synced = await syncManager.syncAll();
+        if (destroyed) return;
+        if (synced.settings) settings = synced.settings;
+        if (synced.state) state = synced.state;
+    }
+
+    /**
+     * The device ceiling. Asked for once, on mount.
+     *
+     * A failure here is not fatal — `agent_count_cap` keeps the spec-minimum
+     * value it was initialised with, which is a legal ceiling on any conformant
+     * device, so the control degrades to conservative rather than to unbounded.
+     */
+    async function loadAgentCountCap() {
+        try {
+            const cap = await invoke('get_agent_count_limit');
+            if (typeof cap === 'number' && cap > 0 && !destroyed) agent_count_cap = cap;
+        } catch (e) {
+            console.error('Failed to read the agent-count limit:', e);
+        }
+    }
+
+    /**
+     * Clamped on the way *in* as well as on the way out.
+     *
+     * A count that arrives above this device's ceiling — from a session started
+     * on a machine with a larger `maxStorageBufferBindingSize`, or from the
+     * desktop's 10 M default — would otherwise be displayed as achievable.
+     */
     async function syncAgentCountFromBackend() {
         try {
             const agentCount = await invoke('get_current_agent_count');
-            console.log('Backend returned agent count:', agentCount);
-            if (agentCount !== null && agentCount !== undefined) {
-                console.log('Updating currentAgentCount from', currentAgentCount, 'to', agentCount);
-                currentAgentCount = agentCount as number;
+            if (typeof agentCount === 'number' && !destroyed) {
+                currentAgentCount = clampSlimeMoldAgentCount(agentCount, agent_count_cap);
             }
         } catch (e) {
             console.error('Failed to sync agent count from backend:', e);
         }
     }
 
-    // Webcam functions
-    async function loadWebcamDevices() {
-        try {
-            webcamDevices = await invoke('get_available_webcam_devices');
-            console.log('Available webcam devices:', webcamDevices);
-        } catch (e) {
-            console.error('Failed to load webcam devices:', e);
-        }
-    }
-
-    async function startWebcamCapture() {
-        try {
-            await invoke('start_slime_mold_webcam_capture');
-            webcamActive = true;
-            console.log('Webcam capture started');
-        } catch (e) {
-            console.error('Failed to start webcam capture:', e);
-        }
-    }
-
-    async function stopWebcamCapture() {
-        try {
-            await invoke('stop_slime_mold_webcam_capture');
-            webcamActive = false;
-            console.log('Webcam capture stopped');
-        } catch (e) {
-            console.error('Failed to stop webcam capture:', e);
-        }
-    }
+    /*
+     * `loadWebcamDevices`, `startWebcamCapture` and `stopWebcamCapture` used to
+     * live here, invoking `get_available_webcam_devices`,
+     * `start_slime_mold_webcam_capture` and `stop_slime_mold_webcam_capture`.
+     * All three are gone with the panel — see the note beside the mask
+     * ImageSelector — and so are their registry stubs, because
+     * test/unit/registry.test.ts fails on a handler nothing calls.
+     */
 
     async function startSimulation() {
         if (running || loading) return;
@@ -1118,6 +1174,19 @@
         });
         eventListeners.add();
 
+        /*
+         * Subscribed first, and synchronously enough that teardown can always
+         * find it. Everything below is awaited, so a user who clicks Back
+         * during the start would otherwise register this listener *after*
+         * onDestroy had already run and looked for it.
+         */
+        listen('fps-update', (event: { payload: number }) => {
+            if (!destroyed) currentFps = event.payload as number;
+        }).then((unlisten) => {
+            if (destroyed) unlisten();
+            else unlistenFps = unlisten;
+        });
+
         // Start the simulation first
         await startSimulation();
 
@@ -1125,30 +1194,28 @@
         await loadAvailablePresets();
         await loadAvailableLuts();
 
-        // Load webcam devices
-        await loadWebcamDevices();
-
         // Sync settings and state from backend
+        await loadAgentCountCap();
         await syncSettingsFromBackend();
         await syncStateFromBackend();
         await syncAgentCountFromBackend();
-
-        // Listen for FPS updates
-        unlistenFps = await listen('fps-update', (event: { payload: number }) => {
-            currentFps = event.payload;
-        });
     });
 
     onDestroy(async () => {
+        // Set before the first await: every resumable path below and in the
+        // sync helpers checks it.
+        destroyed = true;
+
+        if (unlistenFps) {
+            unlistenFps();
+            unlistenFps = null;
+        }
+
         // Clean up the simulation
         try {
             await invoke('destroy_simulation');
         } catch (error) {
             console.error('Failed to destroy simulation on component destroy:', error);
-        }
-
-        if (unlistenFps) {
-            unlistenFps();
         }
 
         // Clean up auto-hide functionality
@@ -1160,18 +1227,45 @@
         }
     });
 
+    /**
+     * The colour-scheme round trip, which was broken here in the *opposite*
+     * direction from Gray-Scott's and Vectors'.
+     *
+     * Those two called only `apply_color_scheme_by_name`, which pushes LUT
+     * bytes but writes no name, so the `<Selector>` — which binds
+     * `state.current_color_scheme` — reverted on the next sync. Slime Mold
+     * called only `update_simulation_state`, which writes the name and pushes
+     * no bytes: the selection stuck and *the picture never changed*. Same
+     * missing half of the same pair, and the harder one to notice, because the
+     * control looks right.
+     *
+     * Both calls, in that order, then one sync. `color_scheme_reversed` is
+     * carried by the `updateColorScheme` seam itself, so it needs no
+     * equivalent — see `updateLutReversed`.
+     */
     async function updateLutName(value: string) {
-        const result = await syncManager.updateStateOptimistic(
-            state,
-            'current_color_scheme',
-            value,
-            true // sync from backend after update
-        );
-        if (result) state = result;
+        if (!state) return;
+        state = { ...state, current_color_scheme: value };
+        try {
+            await invoke('apply_color_scheme_by_name', { colorSchemeName: value });
+            await invoke('update_simulation_state', {
+                stateName: 'current_color_scheme',
+                value,
+            });
+            await syncAllFromBackend();
+        } catch (e) {
+            console.error('Failed to update color scheme:', e);
+        }
     }
 
     async function handleMouseEvent(e: CustomEvent) {
         const event = e.detail as MouseEvent | WheelEvent;
+
+        // Attracting agents counts as using the app; without this the
+        // auto-hide timer was only reset by interaction with the *menu*, so
+        // the controls faded out mid-stroke. GrayScottMode does the same.
+        autoHideManager?.handleUserInteraction();
+
         if (event.type === 'wheel') {
             const wheelEvent = event as WheelEvent;
             wheelEvent.preventDefault();

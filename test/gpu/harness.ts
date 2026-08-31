@@ -12,7 +12,13 @@
  */
 
 import { initGpu, isGpuFailure, describeGpuFailure } from '$lib/engine/gpu/device';
-import { deriveCaps, foldDispatch, SLIME_MOLD_AGENT_STRIDE } from '$lib/engine/gpu/limits';
+import {
+    deriveCaps,
+    foldDispatch,
+    SLIME_MOLD_AGENT_STRIDE,
+    SPEC_MINIMUM_SLIME_MOLD_AGENTS,
+    SPEC_MINIMUM_STORAGE_BUFFER_BINDING_SIZE,
+} from '$lib/engine/gpu/limits';
 import { computeBackingSize, MAX_DEVICE_PIXEL_RATIO } from '$lib/engine/gpu/surface';
 import { createShaderModuleChecked } from '$lib/engine/gpu/errorScopes';
 import {
@@ -66,6 +72,16 @@ import {
     GRADIENT_DISPLAY_MODE,
     GRADIENT_QUANTIZATION_STEP,
 } from '$lib/engine/sims/gradient';
+import {
+    SlimeMoldSimulation,
+    slimeMoldFieldSize,
+    slimeMoldMaxTexels,
+    SLIME_MOLD_TRAIL_STRIDE,
+} from '$lib/engine/sims/slimeMold';
+import {
+    clampSlimeMoldAgentCount,
+    SLIME_MOLD_DESKTOP_AGENTS,
+} from '$lib/engine/sims/slimeMold/settings';
 import { Camera } from '$lib/engine/core/Camera';
 import { calculateTileCount, TEXTURE_FILTERING } from '$lib/engine/render/InfiniteRenderer';
 import { ResourceLedger, instrumentDevice } from '$lib/engine/core/resourceLedger';
@@ -3117,6 +3133,575 @@ test('gradient create/destroy x20 leaves the resource ledger clean', async () =>
     const probe = createStorageBuffer(gpu.device, 256, { label: 'post-gradient probe' });
     const error = await gpu.device.popErrorScope();
     assert(error === null, `device unhealthy after 20 gradient cycles: ${error?.message}`);
+    probe.destroy();
+    churnTarget.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// Slime Mold — M7
+// ---------------------------------------------------------------------------
+
+/**
+ * A small agent pool. SwiftShader is a software rasteriser, and the production
+ * default is a million agents — 16 MB of storage and a million invocations per
+ * frame, which is seconds per test here and tells us nothing a thousand agents
+ * would not.
+ */
+const SLIME_AGENTS = 1024;
+
+/** The 64x64 canvas the harness opened with, so the field is 64x64 too. */
+function slimeField(): [number, number] {
+    return slimeMoldFieldSize(gpu.width, gpu.height, gpu.caps);
+}
+
+/** A context with a doctored `caps`, for the ceilings that cannot be reached. */
+function gpuWithCaps(overrides: Partial<GpuContext['caps']>): GpuContext {
+    return { ...gpu, caps: { ...gpu.caps, ...overrides } };
+}
+
+/** `[x, y, angle, speed]` per agent, straight out of the storage buffer. */
+async function readAgents(sim: SlimeMoldSimulation): Promise<Float32Array> {
+    const bytes = sim.agentCount * SLIME_MOLD_AGENT_STRIDE;
+    return new Float32Array(await readBuffer(gpu.device, sim.agentStorage, bytes));
+}
+
+async function readTrail(sim: SlimeMoldSimulation): Promise<Float32Array> {
+    const [width, height] = sim.fieldSize;
+    const bytes = width * height * SLIME_MOLD_TRAIL_STRIDE;
+    return new Float32Array(await readBuffer(gpu.device, sim.trailStorage, bytes));
+}
+
+async function readMask(sim: SlimeMoldSimulation): Promise<Float32Array> {
+    const [width, height] = sim.fieldSize;
+    const bytes = width * height * SLIME_MOLD_TRAIL_STRIDE;
+    return new Float32Array(await readBuffer(gpu.device, sim.maskStorage, bytes));
+}
+
+/** How many agents differ from `before` in position or heading. */
+function agentsMoved(before: Float32Array, after: Float32Array): number {
+    let moved = 0;
+    for (let i = 0; i < before.length; i += 4) {
+        if (
+            before[i] !== after[i] ||
+            before[i + 1] !== after[i + 1] ||
+            before[i + 2] !== after[i + 2]
+        ) {
+            moved++;
+        }
+    }
+    return moved;
+}
+
+function mean(values: Float32Array): number {
+    let total = 0;
+    for (const value of values) total += value;
+    return total / values.length;
+}
+
+test('slime mold constructs and tears down with no validation error', async () => {
+    gpu.device.pushErrorScope('validation');
+
+    const sim = await SlimeMoldSimulation.create(gpu, { agentCount: SLIME_AGENTS });
+    const [target, view] = renderTarget(48, 'slime mold validation target');
+
+    sim.renderFrame(view, 1 / 60);
+    sim.renderFramePaused(view);
+    sim.handleMouseInteraction(0, 0, 0);
+    sim.renderFrame(view, 1 / 60);
+    sim.handleMouseRelease(0);
+    sim.updateState('mask_pattern', 'Checkerboard');
+    sim.updateSetting('agent_speed_max', 120);
+    sim.resetRuntimeState();
+    sim.resetAgents(9);
+    sim.setAgentCount(SLIME_AGENTS * 2);
+    sim.resize(96, 96);
+    sim.renderFrame(view, 1 / 60);
+    sim.destroy();
+    target.destroy();
+
+    const error = await gpu.device.popErrorScope();
+    assert(error === null, `slime mold produced a validation error: ${error?.message}`);
+});
+
+/**
+ * **The milestone's named acceptance test.**
+ *
+ * `commands/slime_mold.rs:55` takes a bare `u32` into
+ * `self.agent_count = count as usize` (simulation.rs:1491) and then allocates
+ * `count * 16` bytes with no size check anywhere in the path, and the UI's own
+ * maximum was 100 million — 1.6 GB in a single binding. There is no error to
+ * catch: an over-sized storage buffer loses the device, which takes the whole
+ * page with it.
+ *
+ * The real ceiling (7.5 M agents, 120 MB) is far too large to allocate on
+ * SwiftShader, so the cap is lowered on a copy of `caps` instead. That tests
+ * exactly the thing that matters — whether the *simulation* consults the clamp
+ * on all three of its entry points — at a size the software rasteriser can hold.
+ */
+test('the slime mold agent cap clamps instead of losing the device', async () => {
+    // The premise: the desktop default does not fit in a *conformant* browser.
+    // Measured against the spec minimum, not against this device — SwiftShader
+    // grants more than the 128 MiB the reference machine does, so asking the
+    // local adapter would make the test pass here and mean nothing.
+    assert(
+        SLIME_MOLD_DESKTOP_AGENTS * SLIME_MOLD_AGENT_STRIDE >
+            SPEC_MINIMUM_STORAGE_BUFFER_BINDING_SIZE,
+        `the desktop default of ${SLIME_MOLD_DESKTOP_AGENTS} agents fits inside the spec ` +
+            `minimum binding size, so this test is no longer testing anything`
+    );
+    assert(
+        SPEC_MINIMUM_SLIME_MOLD_AGENTS < SLIME_MOLD_DESKTOP_AGENTS,
+        'the derived cap is above the desktop default, so nothing would ever be clamped'
+    );
+
+    const cap = 4096;
+    const capped = gpuWithCaps({ slimeMoldAgents: cap });
+
+    gpu.device.pushErrorScope('out-of-memory');
+    gpu.device.pushErrorScope('validation');
+
+    // (1) construction, at cap + 1.
+    const sim = await SlimeMoldSimulation.create(capped, { agentCount: cap + 1 });
+    assert(sim.agentCount === cap, `construction gave ${sim.agentCount} agents, wanted ${cap}`);
+    assert(
+        sim.agentStorage.size === cap * SLIME_MOLD_AGENT_STRIDE,
+        `the agent buffer is ${sim.agentStorage.size} B, not the clamped ` +
+            `${cap * SLIME_MOLD_AGENT_STRIDE} B`
+    );
+
+    // (2) `setAgentCount`, with the desktop's 10,000,000.
+    sim.setAgentCount(SLIME_MOLD_DESKTOP_AGENTS);
+    assert(
+        sim.agentCount === cap && sim.agentStorage.size === cap * SLIME_MOLD_AGENT_STRIDE,
+        `setAgentCount(10 M) gave ${sim.agentCount} agents in a ${sim.agentStorage.size} B buffer`
+    );
+
+    // (3) applySettings — the path a desktop settings file arrives on.
+    sim.applySettings({ agent_count: SLIME_MOLD_DESKTOP_AGENTS, agent_jitter: 0.2 });
+    assert(
+        sim.agentCount === cap,
+        `a preset carrying 10 M agents gave ${sim.agentCount} rather than the cap`
+    );
+    assert(
+        (sim.getSettings().agent_jitter as number) === 0.2,
+        'clamping the agent count must not swallow the rest of the preset'
+    );
+
+    // Reducing is not rejecting: the sim must still run.
+    const [target, view] = renderTarget(32, 'slime mold clamp target');
+    sim.renderFrame(view, 1 / 60);
+
+    const agents = await readAgents(sim);
+    assert(agents.length === cap * 4, `read back ${agents.length / 4} agents, wanted ${cap}`);
+    assert(!hasNonFinite(agents), 'the clamped pool contains non-finite agents');
+
+    sim.destroy();
+    target.destroy();
+
+    const validation = await gpu.device.popErrorScope();
+    const oom = await gpu.device.popErrorScope();
+    assert(validation === null, `agent clamp produced a validation error: ${validation?.message}`);
+    assert(oom === null, `agent clamp produced an out-of-memory error: ${oom?.message}`);
+
+    // And the pure clamp agrees with what the simulation did.
+    assert(
+        clampSlimeMoldAgentCount(SLIME_MOLD_DESKTOP_AGENTS, cap) === cap,
+        'clampSlimeMoldAgentCount disagrees with the simulation it is supposed to govern'
+    );
+});
+
+/**
+ * The fix to `compute.wgsl`'s agent index, which is the largest single defect
+ * this milestone found.
+ *
+ * `update_agents` used to reconstruct its linear index as
+ * `id.x + id.y * (65535 * 16)` — a *constant* row stride — while the Rust
+ * dispatched `x = min(ceil(n / 256), 65535)`. The two only agree once x
+ * saturates, i.e. above 16.7 M agents; below that, id.y rows 1..15 of every
+ * workgroup land far past the end of the array and return, so only the 16
+ * threads of each workgroup's first row do any work. At the browser default of
+ * 1 M agents that is 62,512 agents moving and 937,488 frozen.
+ *
+ * The stride now comes from `num_workgroups.x`, so the mapping is dense for
+ * every shape the fold can produce. This test pins that at a *folded* dispatch:
+ * `maxWorkgroupsPerDimension` is lowered to 4 so that 3,000 agents need
+ * 12 workgroups laid out 4x3, which is the two-dimensional case the reference
+ * device would only reach at 16.7 M agents.
+ */
+test('every slime mold agent is stepped, including under a folded dispatch', async () => {
+    for (const [label, context, agents] of [
+        ['flat', gpu, 3000],
+        ['folded 4x3', gpuWithCaps({ maxWorkgroupsPerDimension: 4 }), 3000],
+    ] as const) {
+        const sim = await SlimeMoldSimulation.create(context, { agentCount: agents });
+        const [target, view] = renderTarget(32, `slime mold dispatch ${label}`);
+
+        const before = await readAgents(sim);
+        sim.renderFrame(view, 1 / 60);
+        const after = await readAgents(sim);
+
+        const moved = agentsMoved(before, after);
+        // Every agent turns by +/- turn_rate and moves speed*0.016 px, so the
+        // only way one can be unchanged is never having run. A whisker of slack
+        // for an agent whose two sensors happen to read equal.
+        assert(
+            moved >= agents * 0.99,
+            `${label}: only ${moved} of ${agents} agents were stepped — the old ` +
+                `constant-stride index would have moved about ${Math.ceil(agents / 16)}`
+        );
+
+        sim.destroy();
+        target.destroy();
+    }
+});
+
+test('slime mold agents stay inside the field and finite over 30 steps', async () => {
+    const sim = await SlimeMoldSimulation.create(gpu, { agentCount: SLIME_AGENTS });
+    const [width, height] = sim.fieldSize;
+    const [target, view] = renderTarget(32, 'slime mold bounds target');
+
+    // A live brush as well: the cursor displaces agents *after* the movement
+    // step and *before* the toroidal wrap (compute.wgsl:276), which is the one
+    // ordering that could put one outside the field.
+    sim.updateState('cursor_size', 500);
+    sim.updateState('cursor_strength', 50);
+    sim.handleMouseInteraction(0.25, -0.25, 0);
+
+    for (let i = 0; i < 30; i++) sim.renderFrame(view, 1 / 60);
+
+    const agents = await readAgents(sim);
+    assert(!hasNonFinite(agents), 'an agent went non-finite');
+
+    for (let i = 0; i < agents.length; i += 4) {
+        // `x % width` leaves the range half-open, but a tiny negative x plus
+        // width rounds up to width exactly in f32, so the bound is inclusive.
+        assert(
+            agents[i] >= 0 && agents[i] <= width,
+            `agent ${i / 4} is at x=${agents[i]}, outside [0, ${width}]`
+        );
+        assert(
+            agents[i + 1] >= 0 && agents[i + 1] <= height,
+            `agent ${i / 4} is at y=${agents[i + 1]}, outside [0, ${height}]`
+        );
+        assert(agents[i + 3] >= 0, `agent ${i / 4} has a negative speed ${agents[i + 3]}`);
+    }
+
+    sim.destroy();
+    target.destroy();
+});
+
+test('the slime mold trail map stays finite, bounded and non-empty', async () => {
+    // Sparse enough that the deposits stay distinguishable after 20 rounds of
+    // diffusion, which at the default rate is a full four-neighbour average.
+    const sim = await SlimeMoldSimulation.create(gpu, { agentCount: 128 });
+    const [target, view] = renderTarget(64, 'slime mold trail target');
+
+    // Deposit, decay and diffusion are all read-modify-write on one storage
+    // buffer with no synchronisation — the algorithm the Rust runs, and racy on
+    // both builds. What holds regardless is that every write clamps, so the
+    // field cannot leave [0, 1] however the races land.
+    sim.resetRuntimeState();
+    for (let i = 0; i < 20; i++) sim.renderFrame(view, 1 / 60);
+
+    const trail = await readTrail(sim);
+    assert(!hasNonFinite(trail), 'the trail map contains a NaN or an infinity');
+    for (let i = 0; i < trail.length; i++) {
+        assert(trail[i] >= 0 && trail[i] <= 1, `trail[${i}] = ${trail[i]} is outside [0, 1]`);
+    }
+    assert(mean(trail) > 0, 'the trail map is empty — no agent deposited anything');
+
+    // And it must have structure, not a flat wash.
+    let low = Infinity;
+    let high = -Infinity;
+    for (let i = 0; i < trail.length; i++) {
+        if (trail[i] < low) low = trail[i];
+        if (trail[i] > high) high = trail[i];
+    }
+    assert(high > 0.1, `the brightest trail cell is only ${high}`);
+    assert(high - low > 0.05, `the trail map is flat: every cell is within ${high - low}`);
+
+    // The display pass must turn it into a varied, finite picture.
+    const pixels = await readTexturePixels(gpu.device, target);
+    assert(!isUniform(pixels), 'the rendered frame is a flat colour');
+    assert(!hasNonFinite(pixels), 'the rendered frame has non-finite pixels');
+
+    sim.destroy();
+    target.destroy();
+});
+
+/**
+ * Seeding is a pure function of the agent index and `random_seed`
+ * (compute.wgsl:566), so it is the one part of this simulation that *is*
+ * bit-reproducible — the trail map is not, because both the deposit and the
+ * in-place diffusion are unsynchronised read-modify-writes.
+ */
+test('slime mold agent seeding is deterministic for a fixed seed', async () => {
+    const a = await SlimeMoldSimulation.create(gpu, { agentCount: SLIME_AGENTS });
+    const b = await SlimeMoldSimulation.create(gpu, { agentCount: SLIME_AGENTS });
+
+    a.resetAgents(0xc0ffee);
+    b.resetAgents(0xc0ffee);
+    const first = await readAgents(a);
+    const second = await readAgents(b);
+
+    assert(first.length === second.length, 'agent buffers differ in length');
+    for (let i = 0; i < first.length; i++) {
+        assert(
+            first[i] === second[i],
+            `the same seed produced different agents at word ${i}: ${first[i]} vs ${second[i]}`
+        );
+    }
+
+    a.resetAgents(0xc0ffee + 1);
+    const third = await readAgents(a);
+    assert(
+        agentsMoved(first, third) > SLIME_AGENTS * 0.9,
+        'a different seed produced almost the same agents'
+    );
+
+    a.destroy();
+    b.destroy();
+});
+
+/**
+ * Switching *away* from a mask pattern must switch off its effect.
+ *
+ * The Rust dispatches `generate_mask` only when the pattern is neither Disabled
+ * nor Image (simulation.rs:993), so selecting Disabled leaves the previous
+ * pattern sitting in `mask_map` — and `get_mask_factor` is read unconditionally
+ * by all three field kernels, with `update_agents` applying it through whichever
+ * `mask_target` is selected regardless of the pattern. `generate_mask` already
+ * writes 0.0 for Disabled (gradient.wgsl:54); the port simply runs it.
+ */
+test('disabling the slime mold mask actually clears it', async () => {
+    const sim = await SlimeMoldSimulation.create(gpu, { agentCount: SLIME_AGENTS });
+    const [target, view] = renderTarget(32, 'slime mold mask target');
+
+    sim.updateState('mask_pattern', 'Checkerboard');
+    sim.renderFrame(view, 1 / 60);
+    const checkerboard = await readMask(sim);
+    assert(mean(checkerboard) > 0.1, 'the Checkerboard pattern did not reach the mask buffer');
+
+    sim.updateState('mask_pattern', 'Radial Gradient');
+    sim.renderFrame(view, 1 / 60);
+    const radial = await readMask(sim);
+    assert(
+        meanAbsDiff(checkerboard, radial) > 0.05,
+        'changing the mask pattern did not change the mask'
+    );
+
+    sim.updateState('mask_pattern', 'Disabled');
+    sim.renderFrame(view, 1 / 60);
+    const disabled = await readMask(sim);
+    for (let i = 0; i < disabled.length; i++) {
+        assert(disabled[i] === 0, `mask[${i}] = ${disabled[i]} survived being disabled`);
+    }
+
+    sim.destroy();
+    target.destroy();
+});
+
+/**
+ * Both image slots, end to end.
+ *
+ * Slime Mold is the only simulation with two image inputs, and on the GPU they
+ * share one buffer — `generate_image_position` samples `mask_map`
+ * (compute.wgsl:536), and the Rust says as much at simulation.rs:1949. The port
+ * swaps the position plane in around the seeding dispatch and puts the mask
+ * back, so both work at once; on the desktop the later upload simply destroys
+ * the earlier one, and a procedural mask pattern wipes the position image
+ * within a frame of loading it.
+ */
+test('both slime mold image slots reach the compute', async () => {
+    const [width] = slimeField();
+    const file = await splitImageFile(width);
+
+    // --- the mask slot, through MaskTarget::TrailMap ------------------------
+    //
+    // `decay_trail` (compute.wgsl:358) blends the trail toward the mask with
+    // `mask_strength` as the blend factor, so at strength 1 the trail *becomes*
+    // the mask. Black on the left, white on the right.
+    {
+        const sim = await SlimeMoldSimulation.create(gpu, { agentCount: 64 });
+        const [target, view] = renderTarget(32, 'slime mold mask image target');
+
+        await sim.loadImage(file, 'mask');
+        assert(sim.hasImage, 'loadImage(mask) left no decoded plane');
+        sim.updateState('mask_pattern', 'Image');
+        sim.updateState('mask_target', 'Trail Map');
+        sim.updateState('mask_strength', 1);
+        sim.updateState('mask_curve', 1);
+        sim.renderFrame(view, 1 / 60);
+
+        const trail = await readTrail(sim);
+        const [w, h] = sim.fieldSize;
+        let left = 0;
+        let right = 0;
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                if (x < w * 0.375) left += trail[y * w + x];
+                else if (x > w * 0.625) right += trail[y * w + x];
+            }
+        }
+        const leftMean = left / (Math.floor(w * 0.375) * h);
+        const rightMean = right / (Math.floor(w * 0.375) * h);
+        assert(
+            rightMean - leftMean > 0.4,
+            `the mask image's black|white split did not reach the trail map: ` +
+                `${leftMean.toFixed(3)} vs ${rightMean.toFixed(3)}`
+        );
+
+        sim.destroy();
+        target.destroy();
+    }
+
+    // --- the position slot, through the Image position generator ------------
+    //
+    // `generate_image_position` (compute.wgsl:523) is rejection sampling over
+    // the same buffer: 100 attempts of "accept this random point if the image
+    // is brighter there than a random threshold". Against a half-white image
+    // that succeeds on the white half with probability ~1/2 per attempt, so
+    // essentially every agent lands on the right.
+    {
+        const sim = await SlimeMoldSimulation.create(gpu, { agentCount: SLIME_AGENTS });
+
+        await sim.loadImage(file, 'position');
+        assert(sim.hasPositionImage, 'loadImage(position) left no decoded plane');
+        sim.updateState('position_generator', 'Image');
+        sim.resetAgents(4242);
+
+        const agents = await readAgents(sim);
+        const [w] = sim.fieldSize;
+        let onWhite = 0;
+        for (let i = 0; i < agents.length; i += 4) {
+            if (agents[i] > w / 2) onWhite++;
+        }
+        assert(
+            onWhite > SLIME_AGENTS * 0.9,
+            `only ${onWhite} of ${SLIME_AGENTS} agents were seeded on the image's white half`
+        );
+
+        // And the mask must be back afterwards, not left holding the position
+        // plane — the failure mode the Rust has permanently.
+        const mask = await readMask(sim);
+        for (let i = 0; i < mask.length; i++) {
+            assert(mask[i] === 0, `the mask buffer kept the position image at ${i}: ${mask[i]}`);
+        }
+
+        sim.destroy();
+    }
+});
+
+test('resizing the slime mold agent pool keeps the simulation running', async () => {
+    const sim = await SlimeMoldSimulation.create(gpu, { agentCount: SLIME_AGENTS });
+    const [target, view] = renderTarget(64, 'slime mold resize target');
+
+    for (let i = 0; i < 5; i++) sim.renderFrame(view, 1 / 60);
+
+    gpu.device.pushErrorScope('validation');
+    sim.setAgentCount(SLIME_AGENTS * 4);
+    assert(sim.agentCount === SLIME_AGENTS * 4, 'setAgentCount did not take');
+    assert(
+        sim.agentStorage.size === SLIME_AGENTS * 4 * SLIME_MOLD_AGENT_STRIDE,
+        'the agent buffer was not reallocated to the new count'
+    );
+    assert(
+        (sim.getState().agent_count as number) === SLIME_AGENTS * 4,
+        'the state document still reports the old agent count'
+    );
+
+    for (let i = 0; i < 5; i++) sim.renderFrame(view, 1 / 60);
+    const error = await gpu.device.popErrorScope();
+    assert(error === null, `resizing the pool produced a validation error: ${error?.message}`);
+
+    // The new pool must be seeded, not left holding whatever the allocator gave
+    // us — which is exactly what the Rust's buffer pool would hand back.
+    const [width, height] = sim.fieldSize;
+    const agents = await readAgents(sim);
+    assert(!hasNonFinite(agents), 'the resized pool contains non-finite agents');
+    for (let i = 0; i < agents.length; i += 4) {
+        assert(
+            agents[i] >= 0 && agents[i] <= width && agents[i + 1] >= 0 && agents[i + 1] <= height,
+            `agent ${i / 4} of the resized pool is outside the field`
+        );
+    }
+
+    const pixels = await readTexturePixels(gpu.device, target);
+    assert(!isUniform(pixels), 'the frame after a pool resize is a flat colour');
+
+    sim.destroy();
+    target.destroy();
+});
+
+test('the slime mold field size fits every ceiling it is derived from', () => {
+    const caps = gpu.caps;
+    const maxTexels = slimeMoldMaxTexels(caps);
+
+    // The 1D mask kernel cannot be folded, so the pixel count has to fit in one
+    // dispatch dimension at 256 threads a workgroup.
+    assert(
+        maxTexels <= caps.maxWorkgroupsPerDimension * 256,
+        `${maxTexels} texels needs more than ${caps.maxWorkgroupsPerDimension} mask workgroups`
+    );
+    // Two field-sized storage buffers (trail and mask) must bind at once.
+    assert(
+        maxTexels * SLIME_MOLD_TRAIL_STRIDE * 2 <= caps.maxStorageBufferBindingSize,
+        'the trail and mask buffers together exceed the storage binding budget'
+    );
+
+    // A 4K surface at the clamped 2x DPR is the case that has to scale down.
+    const [w, h] = slimeMoldFieldSize(7680, 4320, caps);
+    assert(w * h <= maxTexels, `7680x4320 scaled to ${w}x${h}, still over ${maxTexels} texels`);
+    assertClose(w / h, 7680 / 4320, 0.01, 'the field scale-down must preserve aspect');
+    assert(w <= caps.maxTextureDimension2D && h <= caps.maxTextureDimension2D, 'field over maxDim');
+
+    // And a degenerate surface must still produce something dispatchable.
+    const [dw, dh] = slimeMoldFieldSize(0, 0, caps);
+    assert(dw >= 1 && dh >= 1, 'a zero-sized surface must not give a zero-sized field');
+});
+
+test('slime mold create/destroy x20 leaves the resource ledger clean', async () => {
+    const ledger = new ResourceLedger();
+    const instrumented: GpuContext = { ...gpu, device: instrumentDevice(gpu.device, ledger) };
+
+    const churnTarget = gpu.device.createTexture({
+        label: 'slime mold churn target',
+        size: { width: 32, height: 32 },
+        format: gpu.format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    const churnView = churnTarget.createView();
+
+    for (let i = 0; i < 20; i++) {
+        const sim = await SlimeMoldSimulation.create(instrumented, { agentCount: 256 });
+        // Exercise the paths that could plausibly allocate per event: the brush,
+        // the mask regeneration, and the agent-pool reallocation.
+        sim.handleMouseInteraction(0, 0, 0);
+        sim.updateState('mask_pattern', 'Wave Function');
+        sim.renderFrame(churnView, 1 / 60);
+        sim.setAgentCount(512);
+        sim.renderFrame(churnView, 1 / 60);
+        sim.destroy();
+        sim.destroy();
+    }
+
+    const stats = ledger.stats();
+    // Ten per simulation: seven buffers of its own (sim size, cursor,
+    // background, LUT, agents, trail, mask), the renderer's params buffer, the
+    // camera uniform, and the display texture.
+    assert(
+        stats.created >= 20 * 10,
+        `expected at least ten tracked objects per simulation, saw ${stats.created} over 20`
+    );
+    assert(
+        stats.live === 0,
+        `${stats.live} GPU objects leaked over 20 cycles: ${JSON.stringify(stats.byLabel)}`
+    );
+
+    gpu.device.pushErrorScope('validation');
+    const probe = createStorageBuffer(gpu.device, 256, { label: 'post-slime-mold probe' });
+    const error = await gpu.device.popErrorScope();
+    assert(error === null, `device unhealthy after 20 slime mold cycles: ${error?.message}`);
     probe.destroy();
     churnTarget.destroy();
 });

@@ -511,12 +511,42 @@ Smallest sim in the repo: 1 shader, 316 lines, one already-legal write-only stor
 **Testing note for whoever touches the dither:** the Bayer matrix is indexed from `uv`, not `@builtin(position)`, so it repeats 16× across the target and only a **256-pixel multiple visits all 256 thresholds**. Below that the sampled sub-lattice is biased low and the dither collapses to a hard edge that a smaller test would pass happily. All gradient render tests run at 256² for this reason (`BAYER_PERIOD_PX`). A single Bayer *column* is clustered rather than equidistributed, so accuracy must be measured over a 2D neighbourhood, not per-column.
 
 ### M7 — Slime Mold
-- [ ] Port `compute.wgsl` (610, 5 entry points), `display.wgsl`, `gradient.wgsl`, `quad.wgsl`, `background_render.wgsl`
-- [ ] 15 settings, 9-variant `MaskPattern` / 7-variant `MaskTarget`, 13 built-in presets
-- [ ] **Clamp the UI to `caps.slimeMoldAgents`; drop the default to ~1M**
-- [ ] Image upload for position + mask images
-- [ ] **Test (L3):** cap-clamp fires at cap+1 instead of losing the device; agents in bounds; trail map finite
-- [ ] **Visible:** slime mold trails
+- [x] Port `compute.wgsl` (610, 5 entry points: `update_agents`, `decay_trail`, `diffuse_trail`, `update_agent_speeds` at `16,16,1`, `reset_agents` at `64,1,1`), `display.wgsl`, `gradient.wgsl` (`generate_mask` at `256`, **1D only** — it ignores `id.y`, so it cannot be folded and the field's texel count is capped at `maxWorkgroupsPerDim × 256`), `quad.wgsl`. Renders through `InfiniteRenderer`'s **texture** path
+- [x] ~~Port `background_render.wgsl`~~ — **not ported**, and for a stronger reason than Gray-Scott's: it draws into `display_view`, which the display compute pass then overwrites at *every* texel unconditionally. It has never put a pixel on screen on any build, so `background_mode: White` could not have worked even if its command were reachable — and no `.svelte` calls it
+- [x] 15 settings, 9-variant `MaskPattern` / 7-variant `MaskTarget`, 13 built-in presets. Presets use `..Settings::default()`, so the house "only what differs" rule applies directly — unlike Gray-Scott's. Six pin `pheromone_decay_rate: 100.0` against a default of 10.0
+- [x] **Clamp the UI to `caps.slimeMoldAgents`; default dropped to 1M.** Clamped in three places, each earning its place: the control (so the user is told), the mode (so a restored value never reaches the command), and the handler (last stop before `createBuffer`). `EngineContext` gained `caps()`, `setAgentCount()` and `resetAgents()`
+- [x] Image upload for position + mask images — slots `position` and `mask`
+- [x] **Test (L1):** 75 tests · **Test (L3):** 11 tests · **Test (L4):** 18 tests
+- [ ] **Visible:** slime mold trails — **needs confirming at :9994 in a real browser**; see M3's environment limitation
+
+**The headline defect: `update_agents` was skipping 15 of every 16 agents.**
+
+`compute.wgsl` reconstructed its linear index as `id.x + id.y * (65535 * 16)` — a **constant** row stride — while `simulation.rs:1024` dispatches `x = min(ceil(n/256), 65535)`. The two agree only once x saturates, i.e. above 16.7M agents. Below that, `id.y` rows 1..15 land past the array end and return.
+
+At the browser default of 1M agents that is **62,512 agents moving and 937,488 frozen**. At the desktop default of 10M, about 38% sit frozen. Verified independently against the dispatch arithmetic before accepting the fix.
+
+Fixed in the shared shader — the three agent kernels now take `@builtin(num_workgroups)` and derive the stride from `num_workgroups.x`, which is dense for every shape the fold can produce and needs **no Rust change**, so the desktop build is fixed too. The new L3 test was checked to fail on the pre-fix shader.
+
+This also unblocks the plan's "read `maxComputeWorkgroupsPerDimension` instead of the hardcoded 65535" — which was **unsafe until now**, because the shader baked 65535 into its index math and reading a different limit would have desynchronised the two.
+
+**Other Rust defects fixed rather than reproduced:**
+1. **Disabling the mask did not disable it.** The Rust gates the mask dispatch on `pattern != Disabled && != Image`, so switching away left the old pattern in `mask_map` — and `get_mask_factor` is read unconditionally by all three field kernels. `generate_mask` already writes 0.0 for Disabled; the port simply runs it.
+2. **The trail-map ping-pong is vestigial and halved the diffusion rate.** `compute.wgsl` declares *one* `trail_map` binding, and `diffuse_trail` reads its neighbours and writes its own cell through it — there is no source/destination split. The Rust's swap only meant diffusion ran on a buffer nothing else wrote on alternate frames. Ported as a single buffer; **consequence: trails spread about twice as fast at the same `pheromone_diffusion_rate`.**
+3. **The position and mask images clobbered each other.** They share one GPU buffer (`simulation.rs:1949` admits it), and a procedural mask — regenerated every frame — wiped a freshly-loaded position image within one frame. The port swaps the position plane in around the seeding dispatch and restores the mask after.
+4. **`position_generator` was dead on the desktop.** The mode sends it via `update_simulation_state`, which has **no arm** for it, so the selector changed nothing, every reset re-seeded Random, and the **Image position generator — with its own file picker and `load_slime_mold_position_image` command — was unreachable**. Its option list also used serde spelling (`'UniformCircle'`) against the display spelling (`'Uniform Circle'`) the backend both emits and accepts.
+5. **The colour scheme was the mirror image of M4/M5.** Those modes pushed LUT bytes but never wrote the name, so the selection reverted. Slime Mold wrote the name and never pushed the bytes — the control looked right and the picture never changed, which is the harder half of the pair to notice.
+6. **Resize never re-fit a loaded image** (`reprocess_*_with_current_fit_mode` exists and is uncalled), leaving a stale-sized plane to be rescaled as if it were trail data.
+7. **The agent-count control's validation rejected every value it advertised.** `n % 0.1 !== 0` with the message "Must be a whole number or single decimal place" — but `0.3 % 0.1` is `0.09999999999999998`.
+8. `agent_possible_starting_headings` and `background_mode` are `Settings` fields with no `update_setting` arm at all; `update_setting` clamps `cursor_size`/`cursor_strength` where `update_state` — the path the UI uses — does not; and `update_setting` can panic (`unreachable!()`, two `.expect`s).
+
+**Fixed globally rather than per-mode:** `handlers/settings.ts` and `lifecycle.ts` guarded on `hasEngineContext()` but not on a simulation actually running, while the host's methods throw via `requireSimulation()`. Both now check both, closing that teardown hazard for **every** mode — the M6 defect, generalised.
+
+**Known defects left alone, deliberately:**
+- **`trail_map_filtering` is doubly dead.** `update_display_sampler` reads the app-wide `texture_filtering` instead of the field it was called for, and never rebuilds the bind group holding the old sampler. Separately, `fs_main_texture`'s `filtering_mode` 0 (nearest) and 1 (linear) arms are *the same statement* through one filtering sampler — so "Nearest" has never been nearest on any build. The sampler lives in `InfiniteRenderer`; see the M14 line.
+- `decay_frequency` / `diffusion_frequency` are stored, writable and read nowhere in the Rust. Honoured here as pass schedules; identical at their default of 1.
+- `mask_reversed` is stored, defaulted, serialised and read by nothing — inert on every build, exactly as Gray-Scott's is.
+- **`workgroup_optimizer.rs` (242 ln) does not port.** It picks workgroup sizes by GPU *vendor*, and WebGPU deliberately does not expose vendor reliably. No setting depends on it. The browser derives its size from `maxComputeWorkgroupSizeX`.
+- **`buffer_pool.rs` (95 ln) is not ported.** It dodges Vulkan/Metal allocation latency on a 500 ms-debounced resize; `createBuffer` is cheap in WebGPU, the path is a user gesture rather than per-frame, and its `get_buffer` hands back a buffer with the previous owner's bytes still in it — for an agent pool, live agents at stale positions if a reseed is ever skipped.
 
 ### M8 — Particle Life
 - [ ] Port 11 shaders incl. `compute.wgsl` (280), `init.wgsl` (375), `tile_render.wgsl` (248)
@@ -566,6 +596,7 @@ Learn the grid_clear/grid_populate pattern here — 40% less shader code than Pe
 - [ ] Codemod out the 21 `devicePixelRatio` mouse lines now every mode is proven
 - [ ] **Decide the sRGB question once, for every simulation at the same time.** The shaders convert LUT bytes to linear (`infinite_render.wgsl:289`, `moire/compute.wgsl:66`) because the Rust picks an sRGB surface format, which re-encodes on write. The browser configures with `getPreferredCanvasFormat()`, which returns the **non-sRGB** `bgra8unorm` — so linear values are displayed as though sRGB-encoded and everything is darker than the desktop build. Either configure `viewFormats: ['bgra8unorm-srgb']` and render into the sRGB view, or drop `srgb_to_linear`. Deliberately not fixed per-simulation: Moiré and Gray-Scott share the construct, and fixing one alone would make the two inconsistent for no gain
 - [ ] Wire `setFilteringMode` to the `texture_filtering` control in `Settings.svelte`, which currently reaches nothing (`InfiniteRenderer` and `GrayScottSimulation` both expose it)
+- [ ] **"Nearest" filtering has never been nearest, on any build.** `infinite_render.wgsl`'s `fs_main_texture` runs `filtering_mode` 0 (nearest) and 1 (linear) through *the same statement* and the same filtering sampler, so the two are indistinguishable. Fixing it needs a second, non-filtering sampler in `InfiniteRenderer` and touches all five simulations that draw through it — hence here rather than in M7
 - [ ] Remove `@tauri-apps/*` deps; consolidate per-mode `Settings`/`State` types into `src/lib/types/`
 - [ ] Device-lost recovery; perf pass (consider the additive-render deposit rewrite)
 - [ ] Decide the fate of `src-tauri/` — keep as the desktop build, or retire. **User's call**

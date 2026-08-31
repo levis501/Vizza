@@ -18,7 +18,8 @@
 
 import type { EngineContext } from '$lib/rpc';
 import { emit } from '$lib/rpc';
-import type { CameraState } from '$lib/engine/types';
+import type { CameraState, Caps } from '$lib/engine/types';
+import { slimeMoldAgentCap } from '$lib/engine/gpu/limits';
 import { setEngineContext } from '$lib/rpc/context';
 import {
     defaultMoireSettings,
@@ -42,6 +43,15 @@ import {
     vectorsStateDocument,
     type VectorsState,
 } from '$lib/engine/sims/vectors/settings';
+import {
+    defaultSlimeMoldSettings,
+    defaultSlimeMoldState,
+    normalizeSlimeMoldSettings,
+    slimeMoldStateDocument,
+    updateSlimeMoldSetting,
+    updateSlimeMoldState,
+    type SlimeMoldState,
+} from '$lib/engine/sims/slimeMold/settings';
 
 /**
  * Runtime state the moded UIs read when a simulation has no ported state model.
@@ -62,7 +72,18 @@ function legacyDefaultState(width: number, height: number): Record<string, unkno
 /** How one simulation's settings behave, so the fake is not moiré-specific. */
 interface SettingsModel {
     defaults(): Record<string, unknown>;
-    update(settings: Record<string, unknown>, name: string, value: unknown): void;
+    /**
+     * `state` is passed because Slime Mold's `update_setting` accepts several
+     * *state* names too — the Rust does (simulation.rs:1248-1400 covers the
+     * whole mask block) and `ImageSelector`/`ControlsPanel` disagree about
+     * which command to use, so both have to work.
+     */
+    update(
+        settings: Record<string, unknown>,
+        name: string,
+        value: unknown,
+        state: Record<string, unknown>
+    ): void;
     normalize(input: unknown): Record<string, unknown>;
     /**
      * Runtime state, for a simulation whose menu reads more than the colour
@@ -185,7 +206,42 @@ const MODELS: Record<string, SettingsModel> = {
                 value
             ),
     },
+    /**
+     * Slime Mold, M7. The state model is what makes the two mask <Selector>s
+     * and the position-generator <ButtonSelect> assertable: all three send a
+     * name and read the canonicalised value straight back out of `getState()`,
+     * which is precisely where the desktop build's spellings diverged.
+     */
+    slime_mold: {
+        defaults: () => defaultSlimeMoldSettings() as unknown as Record<string, unknown>,
+        update: (settings, name, value, state) =>
+            void updateSlimeMoldSetting(
+                settings as unknown as Parameters<typeof updateSlimeMoldSetting>[0],
+                state as unknown as SlimeMoldState,
+                name,
+                value
+            ),
+        normalize: (input) =>
+            normalizeSlimeMoldSettings(input) as unknown as Record<string, unknown>,
+        state: () => defaultSlimeMoldState() as unknown as Record<string, unknown>,
+        stateDocument: (state) => slimeMoldStateDocument(state as unknown as SlimeMoldState),
+        updateState: (state, name, value) =>
+            void updateSlimeMoldState(state as unknown as SlimeMoldState, name, value),
+    },
 };
+
+/**
+ * The device the fake reports through `caps()`.
+ *
+ * Deliberately **not** the reference device's 128 MiB. The agent-count control
+ * has two possible sources for its ceiling — `get_agent_count_limit` asking the
+ * engine, and the same command's registry stub answering from the WebGPU spec
+ * minimum when no engine booted — and if both produced 7,549,747 a DOM test
+ * could not tell a wired-up control from a hardcoded one. 64 MiB gives a
+ * distinct 3,774,873, so an assertion on the displayed ceiling is an assertion
+ * that the number came from the engine.
+ */
+const FAKE_STORAGE_BUFFER_BINDING_SIZE = 64 * 1024 * 1024;
 
 /**
  * FNV-1a over a LUT, so a test can tell *which* colour scheme arrived.
@@ -235,6 +291,21 @@ export class FakeEngine implements EngineContext {
 
     currentSimulation(): string | null {
         return this.simulationId;
+    }
+
+    caps(): Caps {
+        return {
+            slimeMoldAgents: slimeMoldAgentCap(FAKE_STORAGE_BUFFER_BINDING_SIZE),
+            flowPool: 1_000_000,
+            particleLife: 500_000,
+            pellets: 50_000,
+            primordial: 1_000_000,
+            grayScottMaxDim: 2048,
+            flowTrailMaxDim: 2048,
+            maxWorkgroupsPerDimension: 65535,
+            maxStorageBufferBindingSize: FAKE_STORAGE_BUFFER_BINDING_SIZE,
+            maxTextureDimension2D: 8192,
+        };
     }
 
     async start(simulationType: string): Promise<void> {
@@ -287,7 +358,7 @@ export class FakeEngine implements EngineContext {
     async updateSetting(name: string, value: unknown): Promise<void> {
         // Throwing on a bad value is the point: sync.ts rolls its optimistic
         // update back in a catch, and that path has to stay exercised.
-        this.model().update(this.settings, name, value);
+        this.model().update(this.settings, name, value, this.state);
         this.record('update_simulation_setting', { name, value });
     }
 
@@ -376,6 +447,21 @@ export class FakeEngine implements EngineContext {
 
     seedRandomNoise(seed?: number): void {
         this.record('seed_random_noise', { seed: seed ?? null });
+    }
+
+    resetAgents(): void {
+        this.record('reset_agents', null);
+    }
+
+    /**
+     * Writes the state field as well as recording, because `agent_count` is
+     * part of the state document (`slimeMoldStateDocument`) and the mode reads
+     * it straight back through `get_current_agent_count`. Recording alone would
+     * let a control that clamps on the way out but not on the way back in pass.
+     */
+    setAgentCount(count: number): void {
+        this.record('set_agent_count', { count });
+        if ('agent_count' in this.state) this.state.agent_count = count;
     }
 
     randomizeSettings(): void {

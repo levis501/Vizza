@@ -12,6 +12,7 @@
  */
 
 import { emit } from './events';
+import { SPEC_MINIMUM_SLIME_MOLD_AGENTS } from '$lib/engine/gpu/limits';
 
 export type Handler = (args: Record<string, unknown>) => unknown | Promise<unknown>;
 
@@ -91,6 +92,21 @@ for (const name of [
 ])
     stub(name);
 stub('get_current_agent_count', null);
+/*
+ * `get_agent_count_limit` has no `#[tauri::command]` behind it — it is the one
+ * command in this table the desktop app never had.
+ *
+ * It exists because the desktop had no ceiling at all: `update_agent_count`
+ * (commands/slime_mold.rs:55) assigns whatever it is given with no clamp, and
+ * `SlimeMoldMode.svelte` offered up to 100 million, which at 16 B/agent is
+ * 1.6 GB against a 128 MiB `maxStorageBufferBindingSize`. In a browser that
+ * does not fail politely, it loses the device. The real ceiling is a property
+ * of the granted limits (`gpu/limits.ts`), so the control has to ask for it.
+ *
+ * The stub value is the ceiling on a device granting exactly the WebGPU spec
+ * minimum — the honest answer when no device exists to ask.
+ */
+stub('get_agent_count_limit', SPEC_MINIMUM_SLIME_MOLD_AGENTS);
 
 // ---------------------------------------------------------------------------
 // Camera and interaction
@@ -214,12 +230,19 @@ for (const name of [
 // ---------------------------------------------------------------------------
 // Gray-Scott's three are absent: M4 deleted its WebcamControls outright rather
 // than ship a Start button that is permanently greyed out, so nothing calls them.
-// M5 did the same to Vectors', so the three `vectors_` names are gone too. Flow,
-// Moiré and Slime Mold still have their panels and so still need theirs.
-for (const sim of ['', 'flow_', 'moire_']) {
+// M5 did the same to Vectors', and M7 to Slime Mold's. Only Flow and Moiré still
+// have panels, so only their names survive.
+//
+// Slime Mold's device-enumeration command is the *unprefixed*
+// `get_available_webcam_devices` (commands/slime_mold.rs:210) — the name looks
+// shared but is not: Flow and Moiré each have their own prefixed one, and
+// nothing else in `src/` called it. Removing Slime Mold's panel therefore
+// orphans the `''` entry, which the "no unreachable handlers" check in
+// test/unit/registry.test.ts turns into a failure rather than dead weight.
+for (const sim of ['flow_', 'moire_']) {
     stub(`get_available_${sim}webcam_devices`, []);
 }
-for (const sim of ['slime_mold', 'flow', 'moire']) {
+for (const sim of ['flow', 'moire']) {
     stub(`start_${sim}_webcam_capture`);
     stub(`stop_${sim}_webcam_capture`);
 }

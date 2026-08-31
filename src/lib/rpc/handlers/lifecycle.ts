@@ -51,6 +51,26 @@ function ifReady(fn: (ctx: ReturnType<typeof getEngineContext>) => void): null {
     return null;
 }
 
+/**
+ * As `ifReady`, but also requires a *constructed simulation*.
+ *
+ * `hasEngineContext()` only says a host exists. Every host method below goes
+ * through `SimulationHost.requireSimulation()`, which throws "No simulation is
+ * running" — so between navigating away and the next `start`, a click on any of
+ * these buttons rejected its promise and the mode logged it. M6 found the same
+ * two-part guard missing in `handlers/colorSchemes.ts:applyToSimulation` and
+ * fixed it there; this is the rest of that fix. The window is real and not
+ * narrow: the auto-hide timer, a queued preset apply and a debounced control
+ * can all land after teardown.
+ */
+function ifRunning(fn: (ctx: ReturnType<typeof getEngineContext>) => void): null {
+    if (!hasEngineContext()) return null;
+    const ctx = getEngineContext();
+    if (ctx.currentSimulation() === null) return null;
+    fn(ctx);
+    return null;
+}
+
 /** Run against the engine if it booted; otherwise degrade without throwing. */
 async function startOrDegrade(id: string): Promise<null> {
     if (!hasEngineContext()) {
@@ -62,9 +82,7 @@ async function startOrDegrade(id: string): Promise<null> {
 }
 
 export function registerLifecycleHandlers(): void {
-    register('start_simulation', async (args) =>
-        startOrDegrade(normalizeId(args.simulation_type))
-    );
+    register('start_simulation', async (args) => startOrDegrade(normalizeId(args.simulation_type)));
 
     for (const [command, id] of Object.entries(START_COMMANDS)) {
         register(command, async () => startOrDegrade(id));
@@ -86,13 +104,23 @@ export function registerLifecycleHandlers(): void {
 
     register('step_simulation', async () => ifReady((c) => c.step()));
 
-    register('reset_runtime_state', async () => ifReady((c) => c.resetRuntimeState()));
+    register('reset_runtime_state', async () => ifRunning((c) => c.resetRuntimeState()));
 
-    register('reset_simulation', async () => ifReady((c) => c.resetSimulation()));
+    register('reset_simulation', async () => ifRunning((c) => c.resetSimulation()));
 
-    register('seed_random_noise', async () => ifReady((c) => c.seedRandomNoise()));
+    /**
+     * Slime Mold's "Clear Trails" — and its `reset_runtime_state`, which the
+     * Rust routes straight to `reset_trails` (slime_mold/simulation.rs:2766),
+     * so the two really are one operation rather than two that happen to agree.
+     * Flow and Pellets reuse the command in M10/M12.
+     */
+    register('reset_trails', async () => ifRunning((c) => c.resetRuntimeState()));
 
-    register('randomize_settings', async () => ifReady((c) => c.randomizeSettings()));
+    register('reset_agents', async () => ifRunning((c) => c.resetAgents()));
+
+    register('seed_random_noise', async () => ifRunning((c) => c.seedRandomNoise()));
+
+    register('randomize_settings', async () => ifRunning((c) => c.randomizeSettings()));
 
     /**
      * In the Rust this tore down poisoned global GPU state. Here the host's

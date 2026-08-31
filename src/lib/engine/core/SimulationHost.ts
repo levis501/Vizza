@@ -20,6 +20,7 @@
 import type { EngineContext } from '$lib/rpc';
 import type {
     CameraState,
+    Caps,
     GpuContext,
     Simulation,
     SimulationFactory,
@@ -59,6 +60,16 @@ interface Resettable {
 /** Optional hook for a simulation that can re-seed its field with noise. */
 interface NoiseSeedable {
     seedRandomNoise(seed?: number): void;
+}
+
+/**
+ * Optional hooks for a simulation with a resizable agent pool — Slime Mold
+ * today, Particle Life and Flow later. `setAgentCount` reallocates a storage
+ * buffer, so callers clamp to `caps` before reaching it.
+ */
+interface AgentPool {
+    resetAgents(): void;
+    setAgentCount(count: number): void;
 }
 
 export interface SimulationHostOptions {
@@ -109,6 +120,11 @@ export class SimulationHost implements EngineContext {
 
     currentSimulation(): string | null {
         return this.simulationId;
+    }
+
+    /** Derived once at device creation (gpu/device.ts:119); never per-frame. */
+    caps(): Caps {
+        return this.gpu.caps;
     }
 
     /** Tear down whatever is running, construct `simulationType`, start the loop. */
@@ -235,6 +251,21 @@ export class SimulationHost implements EngineContext {
         const simulation = this.requireSimulation() as Partial<NoiseSeedable>;
         if (typeof simulation.seedRandomNoise !== 'function') return;
         simulation.seedRandomNoise(seed);
+        this.loop.requestRedraw();
+    }
+
+    /** Optional capabilities, as `reset()` and `seedRandomNoise()` above. */
+    resetAgents(): void {
+        const simulation = this.requireSimulation() as Partial<AgentPool>;
+        if (typeof simulation.resetAgents !== 'function') return;
+        simulation.resetAgents();
+        this.loop.requestRedraw();
+    }
+
+    setAgentCount(count: number): void {
+        const simulation = this.requireSimulation() as Partial<AgentPool>;
+        if (typeof simulation.setAgentCount !== 'function') return;
+        simulation.setAgentCount(count);
         this.loop.requestRedraw();
     }
 

@@ -22,15 +22,41 @@ export const SLIME_MOLD_BUDGET_FRACTION = 0.9;
 /** Absolute cap regardless of a generous device: 8 M agents is already ~130 MB. */
 export const SLIME_MOLD_AGENT_CEILING = 8_000_000;
 
+/**
+ * The agent ceiling implied by a given storage-binding budget.
+ *
+ * Split out of `deriveCaps` because two callers need it without a device: the
+ * `get_agent_count_limit` stub, answered before the engine has booted (or on a
+ * browser with no WebGPU at all), and the fake engine the DOM tests drive.
+ */
+export function slimeMoldAgentCap(storageBufferBindingSize: number): number {
+    return Math.min(
+        SLIME_MOLD_AGENT_CEILING,
+        Math.floor(
+            (storageBufferBindingSize * SLIME_MOLD_BUDGET_FRACTION) / SLIME_MOLD_AGENT_STRIDE
+        )
+    );
+}
+
+/**
+ * `maxStorageBufferBindingSize` every conformant WebGPU implementation must
+ * grant — 128 MiB, and exactly what the reference device grants (WEB_PORT.md,
+ * "Reference device"). Using it as the no-device answer understates a generous
+ * adapter by at most 6% and can never overstate one.
+ */
+export const SPEC_MINIMUM_STORAGE_BUFFER_BINDING_SIZE = 134_217_728;
+
+/** The agent ceiling on a device granting exactly the spec minimum: 7,549,747. */
+export const SPEC_MINIMUM_SLIME_MOLD_AGENTS = slimeMoldAgentCap(
+    SPEC_MINIMUM_STORAGE_BUFFER_BINDING_SIZE
+);
+
 export function deriveCaps(device: GPUDevice): Caps {
     const limits = device.limits;
     const storageBinding = limits.maxStorageBufferBindingSize;
 
     return {
-        slimeMoldAgents: Math.min(
-            SLIME_MOLD_AGENT_CEILING,
-            Math.floor((storageBinding * SLIME_MOLD_BUDGET_FRACTION) / SLIME_MOLD_AGENT_STRIDE)
-        ),
+        slimeMoldAgents: slimeMoldAgentCap(storageBinding),
 
         // Everything below Slime Mold is under 3% of the 128 MiB default binding
         // size at its UI maximum, so these are product decisions, not limits.
