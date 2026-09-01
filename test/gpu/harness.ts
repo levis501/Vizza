@@ -15,6 +15,8 @@ import { initGpu, isGpuFailure, describeGpuFailure } from '$lib/engine/gpu/devic
 import {
     deriveCaps,
     foldDispatch,
+    PARTICLE_LIFE_CEILING,
+    PARTICLE_LIFE_WORKGROUP,
     SLIME_MOLD_AGENT_STRIDE,
     SPEC_MINIMUM_SLIME_MOLD_AGENTS,
     SPEC_MINIMUM_STORAGE_BUFFER_BINDING_SIZE,
@@ -82,6 +84,19 @@ import {
     clampSlimeMoldAgentCount,
     SLIME_MOLD_DESKTOP_AGENTS,
 } from '$lib/engine/sims/slimeMold/settings';
+import {
+    defaultParticleLifeLut,
+    ParticleLifeSimulation,
+    PARTICLE_LIFE_COMPUTE_SHADER_PATH,
+    PARTICLE_LIFE_FRAGMENT_SHADER_PATH,
+    PARTICLE_LIFE_VERTEX_SHADER_PATH,
+} from '$lib/engine/sims/particleLife';
+import {
+    particleLifeMaxSpecies,
+    PARTICLE_LIFE_MAX_SPECIES,
+    PARTICLE_LIFE_SIM_PARAM_BYTES,
+    PARTICLE_STRIDE,
+} from '$lib/engine/sims/particleLife/settings';
 import { Camera } from '$lib/engine/core/Camera';
 import { calculateTileCount, TEXTURE_FILTERING } from '$lib/engine/render/InfiniteRenderer';
 import { ResourceLedger, instrumentDevice } from '$lib/engine/core/resourceLedger';
@@ -3969,6 +3984,808 @@ test('slime mold create/destroy x20 leaves the resource ledger clean', async () 
     const probe = createStorageBuffer(gpu.device, 256, { label: 'post-slime-mold probe' });
     const error = await gpu.device.popErrorScope();
     assert(error === null, `device unhealthy after 20 slime mold cycles: ${error?.message}`);
+    probe.destroy();
+    churnTarget.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// Particle Life — M8
+// ---------------------------------------------------------------------------
+
+/**
+ * A small pool. `compute.wgsl` is O(n²) with no spatial grid, so SwiftShader —
+ * a software rasteriser — takes quadratic wall-clock time in this number.
+ * 256 particles is 65,536 pair evaluations per step, which is instant; the
+ * browser default of 15,000 would be 225 million and time the suite out.
+ */
+const PARTICLE_LIFE_COUNT = 256;
+
+/** A fixed seed, so `init.wgsl` lays out the same field on every run. */
+const PARTICLE_LIFE_SEED = 0x5eed_1234;
+
+interface ParticleView {
+    x: Float32Array;
+    y: Float32Array;
+    vx: Float32Array;
+    vy: Float32Array;
+    species: Uint32Array;
+}
+
+/** Deinterleave the 24-byte `Particle` struct into five parallel arrays. */
+async function readParticles(sim: ParticleLifeSimulation): Promise<ParticleView> {
+    const count = sim.particleCount;
+    const raw = await readBuffer(gpu.device, sim.particleStorage, count * PARTICLE_STRIDE);
+    const floats = new Float32Array(raw);
+    const words = new Uint32Array(raw);
+
+    const view: ParticleView = {
+        x: new Float32Array(count),
+        y: new Float32Array(count),
+        vx: new Float32Array(count),
+        vy: new Float32Array(count),
+        species: new Uint32Array(count),
+    };
+    for (let i = 0; i < count; i++) {
+        view.x[i] = floats[i * 6];
+        view.y[i] = floats[i * 6 + 1];
+        view.vx[i] = floats[i * 6 + 2];
+        view.vy[i] = floats[i * 6 + 3];
+        view.species[i] = words[i * 6 + 4];
+    }
+    return view;
+}
+
+/** The flattened force matrix as the compute kernel sees it. */
+async function readForceMatrix(sim: ParticleLifeSimulation): Promise<Float32Array> {
+    const n = (sim.getSettings().species_count as number) ?? 0;
+    return new Float32Array(await readBuffer(gpu.device, sim.forceMatrixStorage, n * n * 4));
+}
+
+function particleLifeContext(overrides: Partial<GpuContext['caps']> = {}): GpuContext {
+    return { ...gpu, caps: { ...gpu.caps, ...overrides } };
+}
+
+async function makeParticleLife(
+    options: Parameters<typeof ParticleLifeSimulation.create>[1] = {},
+    context: GpuContext = gpu
+): Promise<ParticleLifeSimulation> {
+    return ParticleLifeSimulation.create(context, {
+        particleCount: PARTICLE_LIFE_COUNT,
+        seed: PARTICLE_LIFE_SEED,
+        ...options,
+    });
+}
+
+test('particle life constructs and tears down with no validation error', async () => {
+    gpu.device.pushErrorScope('validation');
+
+    const sim = await makeParticleLife();
+    const [target, view] = renderTarget(48, 'particle life validation target');
+
+    sim.renderFrame(view, 1 / 60);
+    sim.renderFramePaused(view);
+    sim.handleMouseInteraction(0.1, -0.2, 0);
+    sim.renderFrame(view, 1 / 60);
+    sim.handleMouseRelease(0);
+
+    // The traces path, live *and* paused. `render_frame_paused`'s trace branch
+    // on the desktop (simulation.rs:2888) sets bind groups 0 and 1 and omits
+    // group 2, which `vertex.wgsl` statically uses for the camera and the
+    // viewport bounds, and it binds `blit_pipeline` — whose colour target is
+    // the surface format — into an `Rgba8Unorm` attachment. Two validation
+    // errors in one branch, both of which this scope would catch.
+    sim.updateState('traces_enabled', true);
+    sim.renderFrame(view, 1 / 60);
+    sim.renderFramePaused(view);
+    sim.clearTrails();
+
+    sim.updateSetting('species_count', 6);
+    sim.updateSetting('matrix_generator', 'Crystal');
+    sim.updateState('background_color_mode', 'White');
+    sim.setParticleCount(PARTICLE_LIFE_COUNT * 2);
+    sim.randomizeSettings();
+
+    // A preset that moves the species count both up and down. The force-matrix
+    // buffer is sized `species_count²`, so this is the path where a missing
+    // reallocation would show up as a write past the end of a binding rather
+    // than as a wrong picture.
+    sim.applySettings({ species_count: 8, force_matrix: [], max_force: 0.7 });
+    sim.renderFrame(view, 1 / 60);
+    sim.applySettings({ species_count: 2, particle_count: PARTICLE_LIFE_COUNT });
+    sim.renderFrame(view, 1 / 60);
+    sim.updateColorScheme(defaultParticleLifeLut(), true);
+    sim.resetRuntimeState();
+    sim.resize(96, 96);
+    sim.renderFrame(view, 1 / 60);
+    sim.destroy();
+    target.destroy();
+
+    const error = await gpu.device.popErrorScope();
+    assert(error === null, `particle life produced a validation error: ${error?.message}`);
+});
+
+/**
+ * The struct fix, pinned against the shader text.
+ *
+ * `compute.wgsl` and `vertex.wgsl` read the *same* 80-byte uniform buffer, and
+ * they used to declare different structs over it: `compute.wgsl` was one member
+ * short from `brownian_motion` onward, so its `aspect_ratio` sat on the word the
+ * CPU writes `particle_size` into and both pad words were shifted. Nothing
+ * errored — the sizes match and neither field was read — which is exactly why a
+ * test has to hold it: the first person to use `params.aspect_ratio` in
+ * `compute.wgsl` would have silently got 4.0.
+ */
+test('particle life SimParams is declared identically in both shaders', () => {
+    const members = (source: string): string[] => {
+        const body = /struct\s+SimParams\s*\{([\s\S]*?)\n\}/.exec(source);
+        assert(body !== null, 'no struct SimParams found');
+        return body[1]
+            .split('\n')
+            .map((line) => line.replace(/\/\/.*$/, '').trim())
+            .filter((line) => line.length > 0)
+            .map((line) => line.replace(/,$/, ''));
+    };
+
+    const compute = members(getShader(PARTICLE_LIFE_COMPUTE_SHADER_PATH));
+    const vertex = members(getShader(PARTICLE_LIFE_VERTEX_SHADER_PATH));
+
+    assert(
+        compute.join(' | ') === vertex.join(' | '),
+        `SimParams differs between compute.wgsl and vertex.wgsl:\n  ${compute.join(', ')}\n  ${vertex.join(', ')}`
+    );
+    assert(
+        compute.length * 4 === PARTICLE_LIFE_SIM_PARAM_BYTES,
+        `SimParams is ${compute.length} words; the CPU packs ${PARTICLE_LIFE_SIM_PARAM_BYTES} bytes`
+    );
+    // Word 17 is the one that moved.
+    assert(
+        compute[17] === 'particle_size: f32',
+        `word 17 must be particle_size, got "${compute[17]}"`
+    );
+});
+
+/** The species ceiling is a shader constant, not a taste decision. */
+test('the species cap matches fragment.wgsl s colour table', () => {
+    const declared = particleLifeMaxSpecies(getShader(PARTICLE_LIFE_FRAGMENT_SHADER_PATH));
+    assert(declared !== null, 'could not find SpeciesColors.colors in fragment.wgsl');
+    assert(
+        declared === PARTICLE_LIFE_MAX_SPECIES,
+        `fragment.wgsl allows ${declared} species, settings.ts caps at ${PARTICLE_LIFE_MAX_SPECIES}`
+    );
+});
+
+test('every particle is seeded finite, in the world box, and with a valid species', async () => {
+    const sim = await makeParticleLife();
+    const particles = await readParticles(sim);
+    const speciesCount = sim.getSettings().species_count as number;
+
+    assert(!hasNonFinite(particles.x) && !hasNonFinite(particles.y), 'a seeded position is NaN');
+    for (let i = 0; i < particles.x.length; i++) {
+        assert(
+            Math.abs(particles.x[i]) <= 1 && Math.abs(particles.y[i]) <= 1,
+            `particle ${i} seeded outside [-1,1] at (${particles.x[i]}, ${particles.y[i]})`
+        );
+        assert(
+            particles.vx[i] === 0 && particles.vy[i] === 0,
+            `particle ${i} seeded with a velocity; init.wgsl:372 zeroes it`
+        );
+        assert(
+            particles.species[i] < speciesCount,
+            `particle ${i} has species ${particles.species[i]} of ${speciesCount}`
+        );
+    }
+
+    // A fixed seed must give a fixed field, or nothing below is reproducible.
+    const again = await makeParticleLife();
+    const twice = await readParticles(again);
+    for (let i = 0; i < particles.x.length; i++) {
+        assert(
+            particles.x[i] === twice.x[i] && particles.species[i] === twice.species[i],
+            `the same seed gave a different particle ${i}`
+        );
+    }
+
+    sim.destroy();
+    again.destroy();
+});
+
+/**
+ * A fresh simulation must not seed itself with zero.
+ *
+ * `init.wgsl:278` gives particle *i* the seed `random_seed + i`, and its `hash`
+ * (`:27`) is a multiply-xor-shift finalizer with no additive constant, so
+ * `hash(0)` is 0 and `random_f32(0)` is 0.0. `ParticleLifeModel::new`
+ * constructs with `random_seed: 0` (simulation.rs:653), which means **particle
+ * 0 is placed at exactly (-1, -1)** — the bottom-left corner of the world — on
+ * every fresh start of the desktop app, for every position generator that
+ * derives x and y from the seed. One stray particle welded to a corner is not
+ * much, but it costs nothing to remove and it makes the pool's statistics
+ * honest.
+ */
+test('a fresh particle pool is not seeded with zero', async () => {
+    // First, that the artefact is real, by reproducing it deliberately.
+    const zeroed = await makeParticleLife({ seed: 0, particleCount: 64 });
+    const pinned = await readParticles(zeroed);
+    assert(
+        pinned.x[0] === -1 && pinned.y[0] === -1,
+        `seed 0 should put particle 0 at exactly (-1,-1); got (${pinned.x[0]}, ${pinned.y[0]})`
+    );
+    zeroed.destroy();
+
+    // Then, that construction does not choose it. Two independent simulations,
+    // because a constant seed would also make these two identical.
+    const a = await ParticleLifeSimulation.create(gpu, { particleCount: 64 });
+    const b = await ParticleLifeSimulation.create(gpu, { particleCount: 64 });
+    const seedA = a.getState().random_seed as number;
+    const seedB = b.getState().random_seed as number;
+
+    assert(seedA !== 0 && seedB !== 0, 'a fresh simulation seeded itself with 0');
+    assert(seedA !== seedB, `two fresh simulations drew the same seed ${seedA}`);
+
+    const fieldA = await readParticles(a);
+    assert(
+        fieldA.x[0] !== -1 || fieldA.y[0] !== -1,
+        'particle 0 is still welded to the corner despite a non-zero seed'
+    );
+
+    a.destroy();
+    b.destroy();
+});
+
+/**
+ * The species distribution has to match what the chosen generator promises.
+ *
+ * Three generators, each asserted on the property that names it rather than on
+ * a histogram, because a histogram passes for any generator that happens to be
+ * balanced. `Random` is the one that gets the balance test, since balance is
+ * the whole of its claim.
+ */
+test('the type generator assigns the species it says it does', async () => {
+    const sim = await makeParticleLife({ particleCount: 2048 });
+    const speciesCount = sim.getSettings().species_count as number;
+
+    // Random: every species present, and none more than twice the mean.
+    sim.updateSetting('type_generator', 'Random');
+    const random = await readParticles(sim);
+    const counts = new Array<number>(speciesCount).fill(0);
+    for (const s of random.species) counts[s]++;
+    const expected = random.species.length / speciesCount;
+    for (let s = 0; s < speciesCount; s++) {
+        assert(
+            counts[s] > expected * 0.5 && counts[s] < expected * 1.5,
+            `Random gave species ${s} ${counts[s]} particles, expected about ${expected}`
+        );
+    }
+
+    // StripesH: species is a non-decreasing step function of y alone
+    // (init.wgsl:137 — `u32((y + 1) * 0.5 * n) % n`), so sorting by y must sort
+    // by species. Checked as "no particle strictly below another has a strictly
+    // greater species", which is exactly monotonicity and needs no binning.
+    sim.updateSetting('type_generator', 'StripesH');
+    const stripes = await readParticles(sim);
+    const order = Array.from(stripes.species.keys()).sort((a, b) => stripes.y[a] - stripes.y[b]);
+    for (let i = 1; i < order.length; i++) {
+        assert(
+            stripes.species[order[i]] >= stripes.species[order[i - 1]],
+            `StripesH is not monotone in y: species ${stripes.species[order[i - 1]]} at y=` +
+                `${stripes.y[order[i - 1]]} then ${stripes.species[order[i]]} at y=${stripes.y[order[i]]}`
+        );
+    }
+
+    // Radial: species is a step function of distance from the origin
+    // (init.wgsl:125), so the same monotonicity holds in |p|.
+    sim.updateSetting('type_generator', 'Radial');
+    const radial = await readParticles(sim);
+    const radius = (i: number) => Math.hypot(radial.x[i], radial.y[i]);
+    const byRadius = Array.from(radial.species.keys()).sort((a, b) => radius(a) - radius(b));
+    for (let i = 1; i < byRadius.length; i++) {
+        assert(
+            radial.species[byRadius[i]] >= radial.species[byRadius[i - 1]],
+            `Radial is not monotone in |p| at index ${i}`
+        );
+    }
+
+    sim.destroy();
+});
+
+test('the force matrix round-trips to the GPU', async () => {
+    const sim = await makeParticleLife();
+
+    // Deliberately asymmetric, so a transpose would show up.
+    const authored = [
+        [0.1, 0.2, 0.3, 0.4],
+        [-0.5, 0.6, -0.7, 0.8],
+        [0.9, -1.0, 0.11, -0.12],
+        [-0.13, 0.14, -0.15, 0.16],
+    ];
+    sim.updateSetting('force_matrix', authored);
+
+    const uploaded = await readForceMatrix(sim);
+    assert(uploaded.length === 16, `expected 16 floats, got ${uploaded.length}`);
+    for (let i = 0; i < 4; i++) {
+        for (let j = 0; j < 4; j++) {
+            assertClose(
+                uploaded[i * 4 + j],
+                authored[i][j],
+                1e-6,
+                `force_matrix[${i}][${j}] on the GPU`
+            );
+        }
+    }
+
+    // `get_force` indexes `species_a * species_count + species_b`
+    // (compute.wgsl:60), i.e. row-major, which is what `flatten_force_matrix`
+    // produces. Pinned explicitly because a transposed matrix still looks like
+    // particle life, just not the particle life the matrix editor showed.
+    assertClose(uploaded[1 * 4 + 2], authored[1][2], 1e-6, 'row-major flattening');
+
+    sim.destroy();
+});
+
+/**
+ * **The milestone's named acceptance test.**
+ *
+ * `update_setting("matrix_generator")` (simulation.rs:3552) draws a new matrix
+ * into `settings.force_matrix`, then calls
+ * `recreate_bind_groups_with_force_matrix` — which builds a fresh bind group
+ * over the *same, untouched* `force_matrix_buffer` — and then
+ * `update_sim_params`, which writes `SimParams` and not the matrix. The matrix
+ * never reaches the GPU, so **all 22 generators are no-ops on the desktop
+ * build**: the picker updates the number the UI shows and the particles keep
+ * obeying whatever matrix was there before.
+ *
+ * It is masked by the two controls beside it. "Regenerate Matrix" and
+ * "Randomize" both route through `randomize_settings` (simulation.rs:3893),
+ * which *does* `write_buffer`, so a user who picks a generator and then presses
+ * the button sees the right thing and never learns that the picker alone did
+ * nothing.
+ *
+ * `Zero` is the generator under test because its output is bounded by ±0.01
+ * (settings.rs:308) and the default matrix has entries up to 0.3 — so the two
+ * cannot be confused by any tolerance, and the assertion holds whatever the RNG
+ * draws.
+ */
+test('choosing a matrix generator changes the matrix on the GPU', async () => {
+    const sim = await makeParticleLife();
+
+    const before = await readForceMatrix(sim);
+    assert(
+        Math.max(...Array.from(before, Math.abs)) > 0.05,
+        'the default matrix should have entries well outside the Zero generator range'
+    );
+
+    sim.updateSetting('matrix_generator', 'Zero');
+
+    const after = await readForceMatrix(sim);
+    assert(after.length === before.length, 'the matrix changed shape');
+    for (let i = 0; i < after.length; i++) {
+        assert(
+            Math.abs(after[i]) <= 0.01 + 1e-6,
+            `entry ${i} is ${after[i]}, outside the Zero generator's +/-0.01 — the ` +
+                `generator did not reach the GPU`
+        );
+    }
+
+    // And the CPU-side document agrees, so `get_settings` and the buffer cannot
+    // drift apart the way they do upstream.
+    const reported = (sim.getSettings().force_matrix as number[][]).flat();
+    for (let i = 0; i < after.length; i++) {
+        assertClose(reported[i], after[i], 1e-6, `get_settings disagrees at entry ${i}`);
+    }
+
+    sim.destroy();
+});
+
+/**
+ * A step must leave every particle finite, in bounds, and moving.
+ *
+ * "Every", not "most" — the M7 lesson. Slime Mold's `update_agents` was
+ * stepping one agent in sixteen and a sampled test would have passed happily.
+ * Particle Life indexes by a plain `global_invocation_id.x` so it has no such
+ * defect, but the assertion is the cheap half of finding out.
+ *
+ * `brownian_motion` is turned up to 1.0 to make universal motion the *expected*
+ * outcome rather than an accident: at 256 particles in a 2x2 box with
+ * `max_distance` 0.05, most particles have no neighbour close enough to feel a
+ * pair force at all, so without the thermal kick a correct kernel would
+ * legitimately leave many of them still.
+ */
+test('a compute step moves every particle and leaves the pool bounded', async () => {
+    const sim = await makeParticleLife();
+    sim.updateSetting('brownian_motion', 1.0);
+
+    const [target, view] = renderTarget(32, 'particle life step target');
+    const before = await readParticles(sim);
+    sim.renderFrame(view, 1 / 60);
+    const after = await readParticles(sim);
+
+    let moved = 0;
+    for (let i = 0; i < before.x.length; i++) {
+        if (before.x[i] !== after.x[i] || before.y[i] !== after.y[i]) moved++;
+    }
+    assert(
+        moved === before.x.length,
+        `${before.x.length - moved} of ${before.x.length} particles did not move`
+    );
+
+    assert(!hasNonFinite(after.x) && !hasNonFinite(after.y), 'a position went non-finite');
+    assert(!hasNonFinite(after.vx) && !hasNonFinite(after.vy), 'a velocity went non-finite');
+    for (let i = 0; i < after.x.length; i++) {
+        assert(
+            Math.abs(after.x[i]) <= 1 && Math.abs(after.y[i]) <= 1,
+            `particle ${i} left the world box at (${after.x[i]}, ${after.y[i]})`
+        );
+        assert(
+            Math.abs(after.vx[i]) < 1 && Math.abs(after.vy[i]) < 1,
+            `particle ${i} reached an implausible velocity (${after.vx[i]}, ${after.vy[i]})`
+        );
+        assert(
+            after.species[i] === before.species[i],
+            `particle ${i} changed species; the compute kernel must not touch it`
+        );
+    }
+
+    // 120 steps at the defaults, wrapping, must not diverge or go NaN.
+    sim.updateSetting('brownian_motion', 0.5);
+    for (let i = 0; i < 120; i++) sim.renderFrame(view, 1 / 60);
+    const later = await readParticles(sim);
+    assert(!hasNonFinite(later.x) && !hasNonFinite(later.vx), 'the pool diverged over 120 steps');
+    for (let i = 0; i < later.x.length; i++) {
+        assert(
+            Math.abs(later.x[i]) <= 1 && Math.abs(later.y[i]) <= 1,
+            `particle ${i} escaped the toroidal wrap after 120 steps`
+        );
+    }
+
+    // And with wrapping off, the bounce branch (compute.wgsl:256) must hold the
+    // same box — it is a different code path with its own clamps.
+    sim.updateSetting('wrap_edges', false);
+    for (let i = 0; i < 60; i++) sim.renderFrame(view, 1 / 60);
+    const bounced = await readParticles(sim);
+    for (let i = 0; i < bounced.x.length; i++) {
+        assert(
+            Math.abs(bounced.x[i]) <= 1 && Math.abs(bounced.y[i]) <= 1,
+            `particle ${i} escaped the reflecting boundary at (${bounced.x[i]}, ${bounced.y[i]})`
+        );
+    }
+
+    sim.destroy();
+    target.destroy();
+});
+
+/**
+ * The six controls the mode drives through `update_simulation_state`.
+ *
+ * `ParticleLifeModel::update_state` (simulation.rs:3663) matches exactly one
+ * name, `color_scheme`, and logs "Unknown state parameter" for everything else
+ * — so on the desktop the cursor sliders, the Traces checkbox, the Trace Fade
+ * slider, the colour-scheme reverse toggle and the background-colour picker all
+ * move a widget and change nothing. Five of the six had a working
+ * `update_setting` arm sitting unused a hundred lines further up the same file.
+ *
+ * Asserted on GPU-visible consequences where there is one — the background
+ * colour is read out of a rendered texture, not out of the state document —
+ * because a state document that agrees with itself proves nothing.
+ */
+test('state writes reach the simulation, not just the state document', async () => {
+    const sim = await makeParticleLife();
+
+    for (const [name, value] of [
+        ['cursor_size', 0.25],
+        ['cursor_strength', 7.5],
+        ['trace_fade', 0.75],
+        ['traces_enabled', true],
+        ['color_scheme_reversed', false],
+    ] as const) {
+        sim.updateState(name, value);
+        const reported = sim.getState()[name];
+        assert(
+            reported === value,
+            `update_state("${name}") did not take: state reports ${JSON.stringify(reported)}`
+        );
+    }
+
+    // The background mode, checked on the pixels. Traces are on from the loop
+    // above, so this also proves the trail clear picks the colour up.
+    const [target, view] = renderTarget(32, 'particle life background target');
+    sim.updateState('background_color_mode', 'White');
+    sim.clearTrails();
+    sim.renderFrame(view, 1 / 60);
+
+    const [w, h] = sim.fieldSize;
+    const white = await readTexturePixels(gpu.device, sim.trailSurface, w, h);
+    // A corner texel, which no particle at the default size can reach.
+    assert(
+        white[0] > 240 && white[1] > 240 && white[2] > 240,
+        `background_color_mode White gave rgb(${white[0]}, ${white[1]}, ${white[2]})`
+    );
+
+    sim.updateState('background_color_mode', 'Black');
+    sim.clearTrails();
+    sim.renderFrame(view, 1 / 60);
+    const black = await readTexturePixels(gpu.device, sim.trailSurface, w, h);
+    assert(
+        black[0] < 16 && black[1] < 16 && black[2] < 16,
+        `background_color_mode Black gave rgb(${black[0]}, ${black[1]}, ${black[2]})`
+    );
+
+    sim.destroy();
+    target.destroy();
+});
+
+/**
+ * Changing the species count must not throw the user's matrix away.
+ *
+ * `Settings::set_species_count` (settings.rs:169) resizes with zeroes and then,
+ * for any count above two, calls `randomize_force_matrix(&Random)` — which
+ * overwrites **every** entry, including the ones that survived the resize. It
+ * is invisible on the desktop only because every path that reaches it sends its
+ * own preserved matrix immediately afterwards, so the random draw is
+ * overwritten before a frame is rendered. Preserving here means the engine does
+ * what the UI was already doing rather than doing it twice, in opposite
+ * directions.
+ */
+test('growing the species count preserves the existing matrix', async () => {
+    const sim = await makeParticleLife();
+    const authored = [
+        [0.5, -0.5, 0.25, -0.25],
+        [-0.5, 0.5, -0.25, 0.25],
+        [0.125, -0.125, 0.0625, -0.0625],
+        [-0.125, 0.125, -0.0625, 0.0625],
+    ];
+    sim.updateSetting('force_matrix', authored);
+    sim.updateSetting('species_count', 6);
+
+    const grown = await readForceMatrix(sim);
+    assert(grown.length === 36, `expected a 6x6 matrix, got ${grown.length} floats`);
+    for (let i = 0; i < 4; i++) {
+        for (let j = 0; j < 4; j++) {
+            assertClose(
+                grown[i * 6 + j],
+                authored[i][j],
+                1e-6,
+                `entry [${i}][${j}] was not preserved across the species-count change`
+            );
+        }
+    }
+    for (let i = 4; i < 6; i++) {
+        for (let j = 0; j < 6; j++) {
+            assert(
+                grown[i * 6 + j] === 0,
+                `new row ${i} column ${j} is ${grown[i * 6 + j]}, expected a neutral 0`
+            );
+        }
+    }
+
+    // Every particle must now be able to take one of the six species, which is
+    // the other half of a species-count change: the pool is respawned.
+    const particles = await readParticles(sim);
+    const present = new Set(particles.species);
+    assert(
+        present.size === 6,
+        `only ${present.size} of 6 species are represented after the respawn`
+    );
+
+    // Shrinking truncates rather than randomising, symmetrically.
+    sim.updateSetting('species_count', 3);
+    const shrunk = await readForceMatrix(sim);
+    assert(shrunk.length === 9, `expected a 3x3 matrix, got ${shrunk.length} floats`);
+    assertClose(shrunk[2 * 3 + 1], authored[2][1], 1e-6, 'the surviving corner was not preserved');
+
+    sim.destroy();
+});
+
+/**
+ * The particle-count ceiling, at all three of its entry points.
+ *
+ * Unlike Slime Mold's agent pool this is a *compute* ceiling, not a memory one
+ * — 50,000 particles is 1.2 MB — so there is no allocation failure to catch.
+ * What an unclamped count buys is a quadratic kernel with no upper bound: the
+ * Rust's own `update_particle_count` clamps to 100,000 (simulation.rs:3984),
+ * twice what its UI offers, and `caps.particleLife` was a flat 500,000 before
+ * M8 derived it. The cap is lowered on a copy of `caps` here so the clamp is
+ * exercised at a size SwiftShader can step in reasonable time.
+ */
+test('the particle cap clamps instead of running an unbounded quadratic kernel', async () => {
+    const derived = deriveCaps(gpu.device);
+    assert(
+        derived.particleLife === PARTICLE_LIFE_CEILING,
+        `caps.particleLife is ${derived.particleLife}; on any sane device the O(n^2) ` +
+            `ceiling of ${PARTICLE_LIFE_CEILING} should bind, not the memory bound`
+    );
+    // The 1D dispatch must fit without folding — see `particleLifeCap`.
+    assert(
+        Math.ceil(derived.particleLife / PARTICLE_LIFE_WORKGROUP) <=
+            derived.maxWorkgroupsPerDimension,
+        'the particle cap needs more workgroups in x than the device allows'
+    );
+
+    const cap = 512;
+    const capped = particleLifeContext({ particleLife: cap });
+
+    // Entry point 1: construction, from a stored count.
+    const sim = await ParticleLifeSimulation.create(capped, {
+        particleCount: 100_000,
+        seed: PARTICLE_LIFE_SEED,
+    });
+    assert(sim.particleCount === cap, `create ignored the cap: ${sim.particleCount}`);
+
+    // Entry point 2: the command path.
+    sim.setParticleCount(99_999);
+    assert(sim.particleCount === cap, `setParticleCount ignored the cap: ${sim.particleCount}`);
+
+    // Entry point 3: a settings write, which is how a preset arrives.
+    sim.updateSetting('particle_count', 250_000);
+    assert(sim.particleCount === cap, `updateSetting ignored the cap: ${sim.particleCount}`);
+
+    // Clamping must reduce, never reject: the pool still has to be alive.
+    const particles = await readParticles(sim);
+    assert(!hasNonFinite(particles.x), 'the clamped pool was never seeded');
+    assert(
+        sim.getState().particle_count === cap,
+        'the state document must report the clamped count, not the requested one'
+    );
+
+    // And the floor holds too, so a zero cannot produce an empty pool.
+    sim.setParticleCount(0);
+    assert(sim.particleCount === cap, 'a zero count must clamp up to the minimum, then the cap');
+
+    sim.destroy();
+});
+
+/**
+ * Traces decay toward the background colour, not toward black.
+ *
+ * The fade pass blends the previous half over a target freshly cleared to the
+ * background, so what a stale trail converges on is the background — which only
+ * works because the target is cleared rather than loaded. Checked on a
+ * mid-grey background, where "toward the background" and "toward black" point
+ * in opposite directions and a wrong implementation cannot pass by accident.
+ */
+test('trails fade toward the background colour', async () => {
+    const sim = await makeParticleLife({ particleCount: 64 });
+    const [target, view] = renderTarget(32, 'particle life trace target');
+    const [w, h] = sim.fieldSize;
+
+    sim.updateState('background_color_mode', 'Gray18');
+    sim.updateState('traces_enabled', true);
+    // The fastest fade the control offers, so the decay is visible in few frames.
+    sim.updateState('trace_fade', 0.0);
+    sim.clearTrails();
+
+    // A clear alone must already be the background everywhere.
+    const cleared = await readTexturePixels(gpu.device, sim.trailSurface, w, h);
+    assert(!hasNonFinite(cleared), 'the cleared trail is unreadable');
+    assertClose(cleared[0], 46, 3, 'a cleared trail texel should be Gray18 (0.18 -> ~46)');
+
+    for (let i = 0; i < 30; i++) sim.renderFrame(view, 1 / 60);
+    const drawn = await readTexturePixels(gpu.device, sim.trailSurface, w, h);
+    assert(!isUniform(drawn), 'nothing was drawn into the trail texture');
+
+    // Every texel must stay inside the convex hull of "background" and "some
+    // species colour" — a trail decaying toward black would drive texels below
+    // the background grey, which is what this catches.
+    let belowBackground = 0;
+    for (let i = 0; i < drawn.length; i += 4) {
+        if (drawn[i] < 40 && drawn[i + 1] < 40 && drawn[i + 2] < 40) belowBackground++;
+    }
+    assert(
+        belowBackground < drawn.length / 4 / 100,
+        `${belowBackground} texels fell below the Gray18 background; trails are fading to black`
+    );
+
+    // "Clear Trails" must wipe **both** halves — asserted on each of them
+    // directly rather than on whatever the next frame happens to show. The fade
+    // pass reads the half it is not writing, so a clear that misses one leaves
+    // the old trail to be blended straight back in at `1 - fade_amount` on the
+    // very next frame, i.e. the trail reappears a frame after the button.
+    // Whether that is *visible* depends on which half the clear happened to
+    // hit, which is exactly why it has to be checked per-half.
+    sim.clearTrails();
+    for (const [half, texture] of sim.trailSurfaces.entries()) {
+        const pixels = await readTexturePixels(gpu.device, texture, w, h);
+        let dirty = 0;
+        for (let i = 0; i < pixels.length; i += 4) {
+            if (Math.abs(pixels[i] - 46) > 12) dirty++;
+        }
+        assert(dirty === 0, `${dirty} texels survived Clear Trails in ping-pong half ${half}`);
+    }
+
+    // And the frame after the clear stays clear, which is the user-visible half
+    // of the same claim. Particles are redrawn, so only the background is
+    // required to be clean.
+    sim.renderFrame(view, 1 / 60);
+    const afterClear = await readTexturePixels(gpu.device, sim.trailSurface, w, h);
+    let lit = 0;
+    for (let i = 0; i < afterClear.length; i += 4) {
+        if (Math.abs(afterClear[i] - 46) > 12) lit++;
+    }
+    assert(
+        lit < drawn.length / 4 / 20,
+        `${lit} texels survived Clear Trails; the old trail came back a frame later`
+    );
+
+    sim.destroy();
+    target.destroy();
+});
+
+test('particle life renders a varied, finite picture through the infinite renderer', async () => {
+    const sim = await makeParticleLife({ particleCount: 512 });
+    const [target, view] = renderTarget(64, 'particle life canvas');
+
+    // A background the particles cannot be confused with.
+    sim.updateState('background_color_mode', 'Black');
+    for (let i = 0; i < 8; i++) sim.renderFrame(view, 1 / 60);
+
+    const [w, h] = sim.fieldSize;
+    const offscreen = await readTexturePixels(gpu.device, sim.displaySurface, w, h);
+    assert(!isUniform(offscreen), 'the offscreen target is a flat colour; nothing was drawn');
+
+    const pixels = await readTexturePixels(gpu.device, target, 64, 64);
+    assert(!isUniform(pixels), 'the tiled canvas is a flat colour');
+
+    // Zooming out must add tiles rather than shrink the field into a corner,
+    // which is the whole point of the infinite renderer and the one thing the
+    // CPU/GPU tile-count disagreement upstream would break.
+    const wide = calculateTileCount(0.05);
+    const near = calculateTileCount(1.0);
+    assert(wide > near, `zooming out gave ${wide} tiles against ${near} at zoom 1`);
+
+    sim.destroy();
+    target.destroy();
+});
+
+test('particle life create/destroy x20 leaves the resource ledger clean', async () => {
+    const ledger = new ResourceLedger();
+    const instrumented: GpuContext = { ...gpu, device: instrumentDevice(gpu.device, ledger) };
+
+    const churnTarget = gpu.device.createTexture({
+        label: 'particle life churn target',
+        size: { width: 32, height: 32 },
+        format: gpu.format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    const churnView = churnTarget.createView();
+
+    for (let i = 0; i < 20; i++) {
+        const sim = await ParticleLifeSimulation.create(instrumented, {
+            particleCount: 64,
+            seed: PARTICLE_LIFE_SEED,
+        });
+        // The paths that could plausibly allocate per event: the pool resize,
+        // the force-matrix reallocation behind a species-count change, the
+        // trace textures, and the cursor.
+        sim.handleMouseInteraction(0, 0, 0);
+        sim.updateState('traces_enabled', true);
+        sim.renderFrame(churnView, 1 / 60);
+        sim.updateSetting('species_count', 5);
+        sim.setParticleCount(128);
+        sim.renderFrame(churnView, 1 / 60);
+        sim.resize(48, 48);
+        sim.renderFrame(churnView, 1 / 60);
+        sim.destroy();
+        sim.destroy();
+    }
+
+    const stats = ledger.stats();
+    // Eleven per simulation: six uniform buffers (sim params, init params,
+    // species colours, colour mode, viewport, fade), two storage buffers
+    // (particles, force matrix), three textures (display and both trail
+    // halves), plus the renderer's params buffer and the camera uniform — and
+    // the species-count and pool changes reallocate two more.
+    assert(
+        stats.created >= 20 * 11,
+        `expected at least eleven tracked objects per simulation, saw ${stats.created} over 20`
+    );
+    assert(
+        stats.live === 0,
+        `${stats.live} GPU objects leaked over 20 cycles: ${JSON.stringify(stats.byLabel)}`
+    );
+
+    gpu.device.pushErrorScope('validation');
+    const probe = createStorageBuffer(gpu.device, 256, { label: 'post-particle-life probe' });
+    const error = await gpu.device.popErrorScope();
+    assert(error === null, `device unhealthy after 20 particle life cycles: ${error?.message}`);
     probe.destroy();
     churnTarget.destroy();
 });

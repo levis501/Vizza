@@ -61,13 +61,11 @@ export function registerSettingsHandlers(): void {
         applyIfReady(() => getEngineContext().updateState(String(args.state_name), args.value))
     );
 
-    /**
-     * Particle Life's InteractionMatrix has its own command purely because the
-     * Rust needed a distinct entry point; the semantics are identical.
+    /*
+     * `update_particle_life_setting` used to be registered here. It was never a
+     * real command on either side — see the note in registry.ts — and its one
+     * caller now takes the same path as its ten siblings.
      */
-    register('update_particle_life_setting', async (args) =>
-        applyIfReady(() => getEngineContext().updateSetting(String(args.setting_name), args.value))
-    );
 
     register('update_cursor_size', async (args) =>
         applyIfReady(() => getEngineContext().updateState('cursor_size', Number(args.size)))

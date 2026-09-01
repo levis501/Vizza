@@ -26,9 +26,15 @@ struct SimParams {
     cursor_strength: f32,  // Cursor force strength
     cursor_active: u32,  // Whether cursor interaction is active (0 = inactive, 1 = attract, 2 = repel)
     brownian_motion: f32,  // Brownian motion strength (0.0-1.0)
-    aspect_ratio: f32,  // Screen aspect ratio for cursor distance calculation
+    // These last three must match `SimParams` in simulation.rs:79 and in
+    // vertex.wgsl, which share this one 80-byte uniform buffer. This shader
+    // used to declare `aspect_ratio, _pad1, _pad2` here, one member short:
+    // still 80 bytes, so nothing errored, but `aspect_ratio` actually read the
+    // CPU's `particle_size` and every later member was shifted by one word. It
+    // stayed harmless only because nothing below reads either field.
+    particle_size: f32,  // Particle size in world space units (render only)
+    aspect_ratio: f32,  // Screen aspect ratio
     _pad1: u32,
-    _pad2: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;

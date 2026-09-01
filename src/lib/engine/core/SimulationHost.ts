@@ -72,6 +72,28 @@ interface AgentPool {
     setAgentCount(count: number): void;
 }
 
+/**
+ * Optional hooks for a simulation that keeps a trail texture the user can wipe
+ * without disturbing the simulation itself — Particle Life today, Primordial
+ * Particles in M9 (both expose the `clear_trail_texture` command).
+ *
+ * `clearTrails` is not `resetRuntimeState`: Particle Life's "Clear Trails"
+ * button sits beside "Regenerate Particles" and only one of the two should
+ * throw the particles away. That is the same argument that keeps `resetAgents`
+ * separate from `resetSimulation` for Slime Mold.
+ *
+ * `getSpeciesColors` answers `get_species_colors`, which the mode calls after
+ * every colour-scheme, colour-mode and species-count change to repaint the
+ * interaction matrix's row and column headers.
+ */
+interface TrailClearable {
+    clearTrails(): void;
+}
+
+interface SpeciesColored {
+    getSpeciesColors(): number[][];
+}
+
 export interface SimulationHostOptions {
     /** Override the module registry — the fake-engine and leak tests use this. */
     resolveFactory?: (id: SimulationId) => Promise<SimulationFactory>;
@@ -267,6 +289,21 @@ export class SimulationHost implements EngineContext {
         if (typeof simulation.setAgentCount !== 'function') return;
         simulation.setAgentCount(count);
         this.loop.requestRedraw();
+    }
+
+    /** Optional capabilities, as `resetAgents()` above. */
+    clearTrails(): void {
+        const simulation = this.requireSimulation() as Partial<TrailClearable>;
+        if (typeof simulation.clearTrails !== 'function') return;
+        simulation.clearTrails();
+        this.loop.requestRedraw();
+    }
+
+    /** `[]` rather than a throw: a sim without species is not an error. */
+    getSpeciesColors(): number[][] {
+        const simulation = this.simulation as Partial<SpeciesColored> | null;
+        if (!simulation || typeof simulation.getSpeciesColors !== 'function') return [];
+        return simulation.getSpeciesColors();
     }
 
     randomizeSettings(): void {

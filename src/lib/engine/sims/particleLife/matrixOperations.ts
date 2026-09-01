@@ -122,3 +122,39 @@ export function flipSign(matrix: ReadonlyMatrix): number[][] {
 function emptyOf(rows: number, cols: number): number[][] {
     return Array.from({ length: rows }, () => new Array<number>(cols).fill(0));
 }
+
+/**
+ * Put `original`'s diagonal back into `transformed` — the semantics every one of
+ * the eleven buttons in `InteractionMatrix.svelte` has always had.
+ *
+ * The functions above are ports of `matrix_operations.rs`, which transforms
+ * every cell. The **shipped** behaviour is not that: each of the eleven inline
+ * implementations in the component wrote `if (i === j) new[i][j] = old[i][j]`
+ * and the panel says so in as many words ("Transformations preserve diagonal
+ * (self-repulsion) values"). Those eleven Rust functions have no callers
+ * anywhere in the repo — the UI reimplemented all of them — so the
+ * diagonal-preserving version is the only one any user has ever experienced,
+ * and `force_matrix[i][i]` is a species' self-interaction, which is a
+ * physically distinct quantity from how it feels about the *other* species.
+ * Rotating it onto another cell, or flipping it into self-attraction, is not
+ * what any of these buttons is for.
+ *
+ * A composed wrapper rather than a flag on each function, because the choice is
+ * the *caller's* — the Rust semantics stay exactly as `matrix_operations.rs`
+ * wrote them and as the sixteen ported tests pin them, and there is one place
+ * where the divergence is stated instead of eleven near-duplicate branches.
+ *
+ * For a non-square result (a rotation of a rectangular matrix) only the cells
+ * that are on both diagonals are restored, which for the square force matrix is
+ * all of them.
+ */
+export function withPreservedDiagonal(
+    original: ReadonlyMatrix,
+    transformed: ReadonlyMatrix
+): number[][] {
+    const out = transformed.map((row) => row.slice());
+    for (let i = 0; i < out.length && i < original.length; i++) {
+        if (i < out[i].length && i < original[i].length) out[i][i] = original[i][i];
+    }
+    return out;
+}

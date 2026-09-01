@@ -90,7 +90,32 @@ export function registerColorSchemeHandlers(): void {
         return null;
     });
 
+    /**
+     * The colours the running simulation is actually drawing its species with.
+     *
+     * The Rust reads `simulation.state.species_colors` off the Particle Life
+     * model and errors for anything else (commands/colors_schemes.rs:179), so
+     * the count is not a parameter there and is not one here either: it is
+     * whatever `update_lut` last built, which in **Color Scheme** background
+     * mode is `species_count + 1` entries with the background appended last.
+     * `ParticleLifeMode` slices the first `species_count` off the front, which
+     * is why the background has to stay at the end.
+     *
+     * This handler used to sample the current scheme at a `count` argument
+     * defaulting to **4**, and the mode calls it with no arguments — so at five
+     * or more species the interaction matrix got four colours and
+     * `InteractionMatrix` fell back to white for every label past the fourth.
+     *
+     * The fallback keeps that sampling path for the case the Rust returns an
+     * error in: no simulation, or one with no species. Answering with the
+     * requested number of stops off the current scheme is better than an empty
+     * array, which would send the mode to its hardcoded rainbow.
+     */
     register('get_species_colors', async (args) => {
+        if (hasEngineContext() && getEngineContext().currentSimulation() !== null) {
+            const colors = getEngineContext().getSpeciesColors();
+            if (colors.length > 0) return colors;
+        }
         await colorSchemeManager.load();
         const count = Number(args.count ?? args.species_count ?? 4);
         return colorSchemeManager.current().getColors(count);

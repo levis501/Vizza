@@ -61,7 +61,7 @@
                     </div>
                     <div class="control-group">
                         <Selector
-                            options={['Black', 'White', 'Gray18', 'Color Scheme']}
+                            options={background_color_mode_options}
                             bind:value={state.background_color_mode}
                             label="Background Color Mode"
                             on:change={({ detail }) => updateColorMode(detail.value)}
@@ -120,7 +120,7 @@
                 sizeMax={1.0}
                 sizeStep={0.05}
                 strengthMin={0}
-                strengthMax={20}
+                strengthMax={PARTICLE_LIFE_MAX_CURSOR_STRENGTH}
                 strengthStep={0.5}
                 sizePrecision={2}
                 strengthPrecision={1}
@@ -140,30 +140,7 @@
                         value={state.matrix_generator}
                         buttonText="Regenerate Matrix"
                         placeholder="Select matrix generator..."
-                        options={[
-                            { value: 'Random', label: 'Random' },
-                            { value: 'Symmetry', label: 'Symmetry' },
-                            { value: 'Chains', label: 'Chains' },
-                            { value: 'Chains2', label: 'Chains2' },
-                            { value: 'Chains3', label: 'Chains3' },
-                            { value: 'Snakes', label: 'Snakes' },
-                            { value: 'Zero', label: 'Zero' },
-                            { value: 'PredatorPrey', label: 'PredatorPrey' },
-                            { value: 'Symbiosis', label: 'Symbiosis' },
-                            { value: 'Territorial', label: 'Territorial' },
-                            { value: 'Magnetic', label: 'Magnetic' },
-                            { value: 'Crystal', label: 'Crystal' },
-                            { value: 'Wave', label: 'Wave' },
-                            { value: 'Hierarchy', label: 'Hierarchy' },
-                            { value: 'Clique', label: 'Clique' },
-                            { value: 'AntiClique', label: 'AntiClique' },
-                            { value: 'Fibonacci', label: 'Fibonacci' },
-                            { value: 'Prime', label: 'Prime' },
-                            { value: 'Fractal', label: 'Fractal' },
-                            { value: 'RockPaperScissors', label: 'RockPaperScissors' },
-                            { value: 'Cooperation', label: 'Cooperation' },
-                            { value: 'Competition', label: 'Competition' },
-                        ]}
+                        options={matrix_generator_options}
                         on:change={({ detail }) => updateMatrixGenerator(detail.value)}
                         on:buttonclick={async () => {
                             await randomizeMatrix();
@@ -173,15 +150,7 @@
                         value={state.position_generator}
                         buttonText="Regenerate Positions"
                         placeholder="Select position generator..."
-                        options={[
-                            { value: 'Random', label: 'Random' },
-                            { value: 'Center', label: 'Center' },
-                            { value: 'UniformCircle', label: 'UniformCircle' },
-                            { value: 'CenteredCircle', label: 'CenteredCircle' },
-                            { value: 'Ring', label: 'Ring' },
-                            { value: 'Line', label: 'Line' },
-                            { value: 'Spiral', label: 'Spiral' },
-                        ]}
+                        options={position_generator_options}
                         on:change={({ detail }) => updatePositionGenerator(detail.value)}
                         on:buttonclick={async () => {
                             await regeneratePositions();
@@ -191,19 +160,7 @@
                         value={state.type_generator}
                         buttonText="Regenerate Types"
                         placeholder="Select type generator..."
-                        options={[
-                            { value: 'Radial', label: 'Radial' },
-                            { value: 'Polar', label: 'Polar' },
-                            { value: 'StripesH', label: 'Stripes H' },
-                            { value: 'StripesV', label: 'Stripes V' },
-                            { value: 'Random', label: 'Random' },
-                            { value: 'LineH', label: 'Line H' },
-                            { value: 'LineV', label: 'Line V' },
-                            { value: 'Spiral', label: 'Spiral' },
-                            { value: 'Dithered', label: 'Dithered' },
-                            { value: 'WavyLineH', label: 'Wavy Lines H' },
-                            { value: 'WavyLineV', label: 'Wavy Lines V' },
-                        ]}
+                        options={type_generator_options}
                         on:change={({ detail }) => updateTypeGenerator(detail.value)}
                         on:buttonclick={async () => {
                             await regenerateTypes();
@@ -215,8 +172,8 @@
                     <label for="particleCount">Particle Count</label>
                     <NumberDragBox
                         value={state.particle_count}
-                        min={1}
-                        max={50000}
+                        min={PARTICLE_LIFE_MIN_PARTICLES}
+                        max={particle_count_cap}
                         step={1000}
                         precision={0}
                         on:change={(e) => updateParticleCount(e.detail)}
@@ -292,9 +249,56 @@
     import ControlsPanel from './components/shared/ControlsPanel.svelte';
     import { AutoHideManager, createAutoHideEventListeners } from './utils/autoHide';
     import { createSyncManager } from './utils/sync';
+    import {
+        BACKGROUND_COLOR_MODES,
+        PARTICLE_LIFE_MIN_PARTICLES,
+        PARTICLE_LIFE_PARTICLE_CEILING,
+        POSITION_GENERATORS,
+        TYPE_GENERATORS,
+        clampParticleCount,
+    } from '$lib/engine/sims/particleLife/settings';
+    import { MATRIX_GENERATORS } from '$lib/engine/sims/particleLife/matrix';
     import './shared-theme.css';
 
     const dispatch = createEventDispatcher();
+
+    /**
+     * Every option list comes from the engine, none is spelled out here.
+     *
+     * The four enums each existed twice — once in this file's `<ButtonSelect>`
+     * markup and once in the Rust's `update_setting` match — and the copies had
+     * already drifted: the position list offered **seven** of eleven variants,
+     * leaving `RainbowRing`, `ColorBattle`, `ColorWheel` and `RainbowSpiral`
+     * unreachable despite all four being fully implemented in `init.wgsl` and
+     * dispatched by its `switch` at :283. That is the M4 mask-enum defect
+     * again, and the fix is the one M4 settled on: one list, in the engine,
+     * imported here.
+     *
+     * `PascalCase` is what goes on the wire — `update_setting` matches on it and
+     * `get_state` emits it — so the label is only cosmetic. It is the value with
+     * spaces inserted before interior capitals, which turns `StripesH` into
+     * "Stripes H" and `RockPaperScissors` into "Rock Paper Scissors" without a
+     * second table to keep in step.
+     */
+    function optionsFor(values: readonly string[]) {
+        return values.map((value) => ({
+            value,
+            label: value.replace(/([a-z0-9])([A-Z])/g, '$1 $2'),
+        }));
+    }
+
+    const position_generator_options = optionsFor(POSITION_GENERATORS);
+    const type_generator_options = optionsFor(TYPE_GENERATORS);
+    const matrix_generator_options = optionsFor(MATRIX_GENERATORS);
+    const background_color_mode_options = [...BACKGROUND_COLOR_MODES];
+
+    /**
+     * `state.cursor_strength` is clamped to 10 by the backend
+     * (simulation.rs:3487) and the slider advertised **20**, so the top half of
+     * it was inert — the handle moved, the number changed, and every value past
+     * 10 produced the same force. The Rust's clamp is the honest ceiling.
+     */
+    const PARTICLE_LIFE_MAX_CURSOR_STRENGTH = 10;
 
     export let menuPosition: string = 'middle';
     export let autoHideDelay: number = 3000;
@@ -360,12 +364,34 @@
     // Species colors for UI visualization - will be populated from backend
     let speciesColors: string[] = [];
 
+    /**
+     * The particle-count ceiling, asked of the device on mount.
+     *
+     * Initialised to the constant so the control has a truthful maximum before
+     * the answer arrives, and so a failure to ask degrades to the conservative
+     * value rather than to `Infinity`. Three ranges disagreed before this: the
+     * drag box advertised a minimum of **1**, this file clamped to
+     * [1000, 50000], and the Rust clamps to [1000, 100000] — so the box let the
+     * user type a number that could not be reached and the two clamps below it
+     * disagreed about the top.
+     */
+    let particle_count_cap = PARTICLE_LIFE_PARTICLE_CEILING;
+
     // Function to update species colors from backend
     async function updateSpeciesColors() {
         if (!state || !settings) return;
 
         try {
-            const colors = await invoke<[number, number, number, number][]>('get_species_colors');
+            /*
+             * The count is passed even though the desktop command takes none.
+             * It only reaches the fallback path — with a simulation running,
+             * `get_species_colors` answers from `state.species_colors` — but
+             * that fallback defaulted to **4**, so at five or more species the
+             * matrix headers past the fourth fell back to white.
+             */
+            const colors = await invoke<[number, number, number, number][]>('get_species_colors', {
+                count: settings.species_count,
+            });
 
             if (colors && colors.length > 0) {
                 // Convert from linear RGB to sRGB for proper display in UI
@@ -451,6 +477,26 @@
         }
     }
 
+    /**
+     * Changing the species count keeps the matrix the user tuned.
+     *
+     * `Settings::set_species_count` (settings.rs:169) resizes with zeroes and
+     * then, for **any** count above two, overwrites the whole matrix with a
+     * fresh `MatrixGenerator::Random` draw — ignoring `state.matrix_generator`
+     * and throwing away a hand-authored matrix on every bump from 4 to 5. That
+     * has never been visible, because every caller sends its own preserved
+     * matrix immediately afterwards and overwrites the random draw before a
+     * frame is drawn: this function does it below, and `apply_settings` does it
+     * at simulation.rs:3832. The port makes the intent explicit rather than
+     * relying on the overwrite — `resizeForceMatrix` in the engine preserves the
+     * overlap, and so does the loop below.
+     *
+     * New cells get a small random value rather than the engine's zero, and
+     * that difference is deliberate: this write lands last, and a zero row and
+     * column means the new species neither attracts nor repels anything, which
+     * on screen is a species that does nothing at all — a worse first
+     * impression than one with an opinion.
+     */
     // Two-way binding handlers
     async function updateSpeciesCount(value: number) {
         if (settings == undefined) return;
@@ -557,10 +603,19 @@
         }
     }
 
+    /**
+     * The second of the three clamps M7 established for Slime Mold's agents.
+     *
+     * The `NumberDragBox` clamps first so the user is told; this one clamps
+     * because a value restored from a preset, or synced from a session started
+     * on another machine, never passes through the control at all; and the
+     * simulation clamps last, immediately before the `createBuffer` that would
+     * otherwise stall the GPU. See `handlers/particleLife.ts`.
+     */
     async function updateParticleCount(value: number) {
         if (!state) return;
 
-        const newCount = Math.max(1000, Math.min(50000, Math.round(value)));
+        const newCount = clampParticleCount(Math.round(value), particle_count_cap);
         if (newCount === state.particle_count) return;
 
         console.log(`updateParticleCount called: ${state.particle_count} -> ${newCount}`);
@@ -590,6 +645,30 @@
             await syncSettingsFromBackend();
         }
     }
+
+    /*
+     * The five writes below stay on `update_simulation_state`, deliberately.
+     *
+     * On the desktop all five are dead: `ParticleLifeModel::update_state` has
+     * exactly one arm, `"color_scheme"`, and everything else falls through to a
+     * `tracing::warn!` that still returns `Ok(())` — so the command succeeds,
+     * `sync.ts` never rolls its optimistic update back, and the widget shows a
+     * change the backend never saw. `cursor_size`, `cursor_strength`,
+     * `traces_enabled`, `trace_fade` and `background_color_mode` are all in that
+     * set (`color_scheme_reversed` was the sixth; it is handled above).
+     *
+     * The obvious fix is to send them to `update_simulation_setting`, which does
+     * have an arm for each. M7 met the identical defect in Slime Mold's
+     * `position_generator` and settled it the other way, on a principle worth
+     * keeping: **the write goes where the read is**. `get_state` returns all
+     * five and `get_settings` returns none of them, so a mode that reads them
+     * out of the state document and writes them into the settings document
+     * would be describing the same field with two names. The port puts the arm
+     * on the state model instead — `updateParticleLifeState` in
+     * `sims/particleLife/settings.ts` — which is also what keeps
+     * `updateStateOptimistic`'s rollback in play, since a bad value there still
+     * rejects.
+     */
 
     // Mouse interaction controls
     async function updateCursorSize(value: number) {
@@ -670,6 +749,19 @@
         } catch (e) {
             console.error('Failed to load presets:', e);
             available_presets = [];
+        }
+    }
+
+    /**
+     * The device ceiling, asked for once. A failure leaves the conservative
+     * constant in place, exactly as `loadAgentCountCap` does in SlimeMoldMode.
+     */
+    async function loadParticleCountCap() {
+        try {
+            const cap = await invoke('get_particle_count_limit');
+            if (typeof cap === 'number' && cap > 0) particle_count_cap = cap;
+        } catch (e) {
+            console.error('Failed to read the particle-count limit:', e);
         }
     }
 
@@ -1120,7 +1212,7 @@
             await startSimulation();
 
             // Load initial data
-            await Promise.all([loadPresets(), loadColorSchemes()]);
+            await Promise.all([loadPresets(), loadColorSchemes(), loadParticleCountCap()]);
 
             // Set the default preset if available and not already set
             if (available_presets.includes('Default') && !current_preset) {
@@ -1165,12 +1257,28 @@
         }
     });
 
+    /**
+     * Push the LUT bytes *and* write the name into state.
+     *
+     * `apply_color_scheme_by_name` hands the buffer to the simulation but never
+     * records which scheme it was — the engine seam carries bytes and a
+     * reversed flag, nothing else. The `<ColorSchemeSelector>` binds
+     * `state.current_color_scheme`, and every reset, preset and species-count
+     * change ends in `syncSettingsFromBackend()`, so without the second call the
+     * highlight snapped back to whatever the engine still held. M4 fixed this in
+     * Gray-Scott and M5 in Vectors; `update_state`'s **one** working arm on the
+     * desktop is `"color_scheme"` (simulation.rs:3657), so this line is the one
+     * state write in the whole mode that already worked there.
+     */
     async function updateColorScheme(colorSchemeName: string) {
         try {
-            console.log(`Updating color scheme to: ${colorSchemeName}`);
             if (!state) return;
             state.current_color_scheme = colorSchemeName;
             await invoke('apply_color_scheme_by_name', { colorSchemeName });
+            await invoke('update_simulation_state', {
+                stateName: 'color_scheme',
+                value: colorSchemeName,
+            });
 
             // Immediately update species colors after color scheme change
             await updateSpeciesColors();
@@ -1179,17 +1287,21 @@
         }
     }
 
+    /**
+     * Reversal goes through the colour-scheme command, not a bare state write.
+     *
+     * This used to be `updateStateOptimistic('color_scheme_reversed')`, which on
+     * the desktop hit `update_state`'s `_ =>` warning arm and did nothing at
+     * all, and in the browser would set the flag without re-deriving the LUT the
+     * species colours are sampled from. `toggle_color_scheme_reversed` is the
+     * command that re-derives and pushes the bytes, and it mirrors the flag into
+     * state on its way through — the same fix M7 made in SlimeMoldMode and M5 in
+     * VectorsMode.
+     */
     async function updateColorSchemeReversed(reversed: boolean) {
         try {
-            console.log(
-                `Updating color scheme reversed to: ${reversed}, current color scheme: ${state!.current_color_scheme}`
-            );
-            const result = await syncManager.updateStateOptimistic(
-                state,
-                'color_scheme_reversed',
-                reversed
-            );
-            if (result) state = result;
+            await invoke('toggle_color_scheme_reversed');
+            if (state) state = { ...state, color_scheme_reversed: reversed };
 
             // Immediately update species colors after color scheme change
             await updateSpeciesColors();

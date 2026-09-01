@@ -27,7 +27,19 @@ const READ_WRITE_FORMATS = new Set(['r32uint', 'r32sint', 'r32float']);
  * declares 1x1x1 is a per-pixel or per-element kernel and is a real perf bug.
  */
 const SINGLE_INVOCATION_SHADERS = new Set([
-    // Writes one element of the force matrix, to avoid a CPU round-trip.
+    // Writes one element of the force matrix, to avoid a CPU round-trip — so
+    // 1x1x1 is correct here, not wasteful, and it stays allow-listed rather
+    // than moving into KNOWN_VIOLATIONS below.
+    //
+    // M8 established that it is also **dead on both builds**: the only function
+    // that dispatches it, `update_force_element_gpu`
+    // (particle_life/simulation.rs:2285), has no caller anywhere in `src-tauri`,
+    // and neither does `randomize_force_matrix_gpu`, which owns the sibling
+    // force_randomize.wgsl. Every force-matrix write that actually happens on
+    // either build is CPU-side plus a `write_buffer`, which is what the browser
+    // port does too. Listing it as a known *violation* would schedule a
+    // remediation for a shader that has no defect and no caller; it is recorded
+    // here instead so the next reader does not go looking for its dispatch.
     'src-tauri/src/simulations/particle_life/shaders/force_update.wgsl',
 ]);
 
@@ -48,9 +60,7 @@ const KNOWN_VIOLATIONS = {
         'src-tauri/src/simulations/flow/shaders/trail_decay_diffusion.wgsl:46',
     ],
     // Remediation (e) — M10 Pellets.
-    atomicInReadStorage: [
-        'src-tauri/src/simulations/pellets/shaders/physics_compute.wgsl:65',
-    ],
+    atomicInReadStorage: ['src-tauri/src/simulations/pellets/shaders/physics_compute.wgsl:65'],
     // Remediation (f) is fixed: gray_scott/reaction_diffusion.wgsl is 8x8x1.
     singleInvocationWorkgroup: [],
 };

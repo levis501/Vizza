@@ -103,6 +103,28 @@ export interface EngineContext {
      */
     setAgentCount(count: number): void;
 
+    /**
+     * Wipe the trail texture without disturbing the simulation.
+     *
+     * The `clear_trail_texture` command, which Particle Life's "Clear Trails"
+     * button fires and Primordial Particles will too. A no-op for the eight
+     * simulations that keep no trail, in the same style as `seedRandomNoise`.
+     * Distinct from `resetSimulation()` because Particle Life offers both
+     * buttons and only one of them should throw the particles away.
+     */
+    clearTrails(): void;
+
+    /**
+     * The per-species colours the running simulation is drawing with, in linear
+     * RGBA and species-first order.
+     *
+     * `get_species_colors` — Particle Life's interaction matrix labels its rows
+     * and columns with them, so the mode re-fetches after every colour-scheme,
+     * background-mode and species-count change. Empty for a simulation with no
+     * species, which is every other one.
+     */
+    getSpeciesColors(): number[][];
+
     randomizeSettings(): void;
     updateColorScheme(lut: Uint32Array, reversed: boolean): void;
 

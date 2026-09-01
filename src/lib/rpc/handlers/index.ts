@@ -15,6 +15,7 @@ import { registerPresetHandlers } from './presets';
 import { registerImageHandlers } from './images';
 import { registerGradientHandlers } from './gradient';
 import { registerSlimeMoldHandlers } from './slimeMold';
+import { registerParticleLifeHandlers } from './particleLife';
 
 let installed = false;
 
@@ -30,6 +31,7 @@ export function installHandlers(): void {
     registerImageHandlers();
     registerGradientHandlers();
     registerSlimeMoldHandlers();
+    registerParticleLifeHandlers();
 }
 
 export { setPointerCanvas };

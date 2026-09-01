@@ -19,7 +19,7 @@
 import type { EngineContext } from '$lib/rpc';
 import { emit } from '$lib/rpc';
 import type { CameraState, Caps } from '$lib/engine/types';
-import { slimeMoldAgentCap } from '$lib/engine/gpu/limits';
+import { particleLifeCap, slimeMoldAgentCap } from '$lib/engine/gpu/limits';
 import { setEngineContext } from '$lib/rpc/context';
 import {
     defaultMoireSettings,
@@ -52,6 +52,16 @@ import {
     updateSlimeMoldState,
     type SlimeMoldState,
 } from '$lib/engine/sims/slimeMold/settings';
+import {
+    defaultParticleLifeSettings,
+    defaultParticleLifeState,
+    normalizeParticleLifeSettings,
+    particleLifeStateDocument,
+    updateParticleLifeSetting,
+    updateParticleLifeState,
+    type ParticleLifeSettings,
+    type ParticleLifeState,
+} from '$lib/engine/sims/particleLife/settings';
 
 /**
  * Runtime state the moded UIs read when a simulation has no ported state model.
@@ -103,8 +113,18 @@ interface SettingsModel {
      * worth providing where it exists: the real model *throws* on an unknown
      * name, which is what `sync.ts` needs in order to roll an optimistic update
      * back. A fake that accepts everything cannot exercise that path.
+     *
+     * `settings` is passed for the mirror-image of the reason `update` is
+     * passed `state`: Particle Life's state writes go through the same model as
+     * its settings writes, and one of them (`species_count`) resizes the force
+     * matrix, which is a *settings* field.
      */
-    updateState?(state: Record<string, unknown>, name: string, value: unknown): void;
+    updateState?(
+        state: Record<string, unknown>,
+        name: string,
+        value: unknown,
+        settings: Record<string, unknown>
+    ): void;
 }
 
 /**
@@ -228,6 +248,41 @@ const MODELS: Record<string, SettingsModel> = {
         updateState: (state, name, value) =>
             void updateSlimeMoldState(state as unknown as SlimeMoldState, name, value),
     },
+    /**
+     * Particle Life, M8. Its settings and state are entangled in a way none of
+     * the others are — `species_count` resizes `force_matrix`, and six *state*
+     * writes reach arms that live on `update_setting` in the Rust — so both
+     * halves have to be real for a DOM test to mean anything.
+     *
+     * The state model is the load-bearing half here. `ParticleLifeModel::update_state`
+     * on the desktop matches only `"color_scheme"` and warns on everything else
+     * while still returning `Ok(())`, so six controls move and change nothing;
+     * `updateParticleLifeState` is where the port joins those writes back up. A
+     * fake that echoed `state[name] = value` would pass whether or not that
+     * happened, and would also lose the clamps — `cursor_strength` to 10, the
+     * force matrix to [-1, 1] — which is exactly what the specs assert.
+     */
+    particle_life: {
+        defaults: () => defaultParticleLifeSettings() as unknown as Record<string, unknown>,
+        update: (settings, name, value, state) =>
+            void updateParticleLifeSetting(
+                settings as unknown as ParticleLifeSettings,
+                state as unknown as ParticleLifeState,
+                name,
+                value
+            ),
+        normalize: (input) =>
+            normalizeParticleLifeSettings(input) as unknown as Record<string, unknown>,
+        state: () => defaultParticleLifeState() as unknown as Record<string, unknown>,
+        stateDocument: (state) => particleLifeStateDocument(state as unknown as ParticleLifeState),
+        updateState: (state, name, value, settings) =>
+            void updateParticleLifeState(
+                settings as unknown as ParticleLifeSettings,
+                state as unknown as ParticleLifeState,
+                name,
+                value
+            ),
+    },
 };
 
 /**
@@ -297,7 +352,13 @@ export class FakeEngine implements EngineContext {
         return {
             slimeMoldAgents: slimeMoldAgentCap(FAKE_STORAGE_BUFFER_BINDING_SIZE),
             flowPool: 1_000_000,
-            particleLife: 500_000,
+            // From the same derivation `deriveCaps` uses, not the 500,000
+            // placeholder that stood here before Particle Life was ported: the
+            // ceiling the control shows must be the one the engine would give,
+            // and here — unlike Slime Mold's — the answer is device-independent
+            // in practice, because it is a compute budget rather than a memory
+            // one. See gpu/limits.ts.
+            particleLife: particleLifeCap(FAKE_STORAGE_BUFFER_BINDING_SIZE, 65535),
             pellets: 50_000,
             primordial: 1_000_000,
             grayScottMaxDim: 2048,
@@ -368,7 +429,7 @@ export class FakeEngine implements EngineContext {
         // engine" should not depend on the value being accepted.
         this.record('update_simulation_state', { name, value });
         const model = this.model();
-        if (model.updateState) model.updateState(this.state, name, value);
+        if (model.updateState) model.updateState(this.state, name, value, this.settings);
         else this.state[name] = value;
     }
 
@@ -462,6 +523,20 @@ export class FakeEngine implements EngineContext {
     setAgentCount(count: number): void {
         this.record('set_agent_count', { count });
         if ('agent_count' in this.state) this.state.agent_count = count;
+    }
+
+    clearTrails(): void {
+        this.record('clear_trails', null);
+    }
+
+    /**
+     * Reads the state field rather than inventing colours, so a spec can seed
+     * `species_colors` and assert the mode paints the interaction matrix from
+     * what the engine actually reports.
+     */
+    getSpeciesColors(): number[][] {
+        const colors = this.state.species_colors;
+        return Array.isArray(colors) ? (colors as number[][]).map((color) => [...color]) : [];
     }
 
     randomizeSettings(): void {

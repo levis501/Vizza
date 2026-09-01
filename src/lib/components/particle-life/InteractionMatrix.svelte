@@ -177,8 +177,22 @@
 
 <script lang="ts">
     import { createEventDispatcher } from 'svelte';
-    import { invoke } from '$lib/rpc';
     import NumberDragBox from '../inputs/NumberDragBox.svelte';
+    import {
+        flipHorizontal,
+        flipSign,
+        flipVertical,
+        rotateClockwise,
+        rotateCounterclockwise,
+        scaleForceMatrix,
+        shiftDown,
+        shiftLeft,
+        shiftRight,
+        shiftUp,
+        withPreservedDiagonal,
+        zeroMatrix as zeroAllEntries,
+        type ReadonlyMatrix,
+    } from '$lib/engine/sims/particleLife/matrixOperations';
 
     const dispatch = createEventDispatcher();
 
@@ -211,266 +225,68 @@
         dispatch('matrixUpdate', { i, j, value });
     }
 
-    // Matrix transformation functions
+    /**
+     * Apply one of the eleven transforms and hand the result to the parent.
+     *
+     * All eleven used to be written out inline here — about 230 lines of
+     * index arithmetic with no test behind any of it, in a component whose only
+     * other job is to draw a grid of drag boxes. They are now
+     * `engine/sims/particleLife/matrixOperations.ts`, the port of
+     * `matrix_operations.rs`, whose sixteen Rust tests came across with it.
+     *
+     * `withPreservedDiagonal` is what keeps the *shipped* semantics: the module
+     * transforms every cell, as the Rust does, and this component has always
+     * held `force_matrix[i][i]` fixed — see the note under the buttons, and the
+     * module's own comment for why the divergence is deliberate rather than an
+     * oversight to be tidied away.
+     *
+     * The parent is the only thing that talks to the backend. Ten of the eleven
+     * buttons already worked that way; `flipMatrixSign` was the exception,
+     * invoking `update_particle_life_setting` — a command with no `#[tauri::command]`
+     * behind it, passing the setting name under a key (`setting`) the shim does
+     * not rename, and then dispatching without the `matrix` field its parent
+     * destructures. Three independent faults, all of which the shared path
+     * simply does not have.
+     */
+    function applyTransform(
+        type: string,
+        transform: (matrix: ReadonlyMatrix) => number[][],
+        extra: Record<string, unknown> = {}
+    ) {
+        const current = settings.force_matrix;
+        if (!current) return;
+
+        const newMatrix = withPreservedDiagonal(current, transform(current));
+        settings.force_matrix = newMatrix;
+        dispatch('matrixTransform', { type, matrix: newMatrix, ...extra });
+    }
+
     function scaleMatrix(scaleFactor: number) {
-        if (!settings.force_matrix) return;
-
-        const speciesCount = settings.species_count;
-        const newMatrix = Array(speciesCount)
-            .fill(null)
-            .map(() => Array(speciesCount).fill(0));
-
-        for (let i = 0; i < speciesCount; i++) {
-            for (let j = 0; j < speciesCount; j++) {
-                if (i === j) {
-                    // Preserve diagonal values (self-repulsion)
-                    newMatrix[i][j] = settings.force_matrix[i][j];
-                } else {
-                    // Scale non-diagonal values
-                    newMatrix[i][j] = Math.max(
-                        -1,
-                        Math.min(1, settings.force_matrix[i][j] * scaleFactor)
-                    );
-                }
-            }
-        }
-
-        settings.force_matrix = newMatrix;
-        dispatch('matrixTransform', { type: 'scale', factor: scaleFactor, matrix: newMatrix });
+        applyTransform('scale', (m) => scaleForceMatrix(m, scaleFactor), { factor: scaleFactor });
     }
 
-    function flipMatrixHorizontal() {
-        if (!settings.force_matrix) return;
+    const flipMatrixHorizontal = () => applyTransform('flipHorizontal', flipHorizontal);
+    const flipMatrixVertical = () => applyTransform('flipVertical', flipVertical);
+    const rotateMatrixClockwise = () => applyTransform('rotateClockwise', rotateClockwise);
+    const rotateMatrixCounterclockwise = () =>
+        applyTransform('rotateCounterclockwise', rotateCounterclockwise);
 
-        const speciesCount = settings.species_count;
-        const newMatrix = Array(speciesCount)
-            .fill(null)
-            .map(() => Array(speciesCount).fill(0));
+    /*
+     * The four shift buttons moved the matrix the *opposite* way to their own
+     * arrows and their own dispatched names: "Shift matrix left" (←) computed
+     * `new[i][j] = old[i][j - 1]`, which slides every column one place to the
+     * **right**, and then dispatched `type: 'shiftLeft'`. Same inversion in all
+     * four. The pairs are exact inverses of each other, so no matrix that was
+     * reachable before is unreachable now — pressing ← now does what → used to
+     * — and the control stops disagreeing with itself.
+     */
+    const shiftMatrixLeft = () => applyTransform('shiftLeft', shiftLeft);
+    const shiftMatrixRight = () => applyTransform('shiftRight', shiftRight);
+    const shiftMatrixUp = () => applyTransform('shiftUp', shiftUp);
+    const shiftMatrixDown = () => applyTransform('shiftDown', shiftDown);
 
-        for (let i = 0; i < speciesCount; i++) {
-            for (let j = 0; j < speciesCount; j++) {
-                if (i === j) {
-                    newMatrix[i][j] = settings.force_matrix[i][j];
-                } else {
-                    newMatrix[i][j] = settings.force_matrix[i][speciesCount - 1 - j];
-                }
-            }
-        }
-
-        settings.force_matrix = newMatrix;
-        dispatch('matrixTransform', { type: 'flipHorizontal', matrix: newMatrix });
-    }
-
-    function flipMatrixVertical() {
-        if (!settings.force_matrix) return;
-
-        const speciesCount = settings.species_count;
-        const newMatrix = Array(speciesCount)
-            .fill(null)
-            .map(() => Array(speciesCount).fill(0));
-
-        for (let i = 0; i < speciesCount; i++) {
-            for (let j = 0; j < speciesCount; j++) {
-                if (i === j) {
-                    newMatrix[i][j] = settings.force_matrix[i][j];
-                } else {
-                    newMatrix[i][j] = settings.force_matrix[speciesCount - 1 - i][j];
-                }
-            }
-        }
-
-        settings.force_matrix = newMatrix;
-        dispatch('matrixTransform', { type: 'flipVertical', matrix: newMatrix });
-    }
-
-    function rotateMatrixClockwise() {
-        if (!settings.force_matrix) return;
-
-        const speciesCount = settings.species_count;
-        const newMatrix = Array(speciesCount)
-            .fill(null)
-            .map(() => Array(speciesCount).fill(0));
-
-        for (let i = 0; i < speciesCount; i++) {
-            for (let j = 0; j < speciesCount; j++) {
-                if (i === j) {
-                    newMatrix[i][j] = settings.force_matrix[i][j];
-                } else {
-                    newMatrix[i][j] = settings.force_matrix[speciesCount - 1 - j][i];
-                }
-            }
-        }
-
-        settings.force_matrix = newMatrix;
-        dispatch('matrixTransform', { type: 'rotateClockwise', matrix: newMatrix });
-    }
-
-    function rotateMatrixCounterclockwise() {
-        if (!settings.force_matrix) return;
-
-        const speciesCount = settings.species_count;
-        const newMatrix = Array(speciesCount)
-            .fill(null)
-            .map(() => Array(speciesCount).fill(0));
-
-        for (let i = 0; i < speciesCount; i++) {
-            for (let j = 0; j < speciesCount; j++) {
-                if (i === j) {
-                    newMatrix[i][j] = settings.force_matrix[i][j];
-                } else {
-                    newMatrix[i][j] = settings.force_matrix[j][speciesCount - 1 - i];
-                }
-            }
-        }
-
-        settings.force_matrix = newMatrix;
-        dispatch('matrixTransform', { type: 'rotateCounterclockwise', matrix: newMatrix });
-    }
-
-    function shiftMatrixLeft() {
-        if (!settings.force_matrix) return;
-
-        const speciesCount = settings.species_count;
-        const newMatrix = Array(speciesCount)
-            .fill(null)
-            .map(() => Array(speciesCount).fill(0));
-
-        for (let i = 0; i < speciesCount; i++) {
-            for (let j = 0; j < speciesCount; j++) {
-                if (i === j) {
-                    newMatrix[i][j] = settings.force_matrix[i][j];
-                } else {
-                    const newJ = (j - 1 + speciesCount) % speciesCount;
-                    newMatrix[i][j] = settings.force_matrix[i][newJ];
-                }
-            }
-        }
-
-        settings.force_matrix = newMatrix;
-        dispatch('matrixTransform', { type: 'shiftLeft', matrix: newMatrix });
-    }
-
-    function shiftMatrixRight() {
-        if (!settings.force_matrix) return;
-
-        const speciesCount = settings.species_count;
-        const newMatrix = Array(speciesCount)
-            .fill(null)
-            .map(() => Array(speciesCount).fill(0));
-
-        for (let i = 0; i < speciesCount; i++) {
-            for (let j = 0; j < speciesCount; j++) {
-                if (i === j) {
-                    newMatrix[i][j] = settings.force_matrix[i][j];
-                } else {
-                    const newJ = (j + 1) % speciesCount;
-                    newMatrix[i][j] = settings.force_matrix[i][newJ];
-                }
-            }
-        }
-
-        settings.force_matrix = newMatrix;
-        dispatch('matrixTransform', { type: 'shiftRight', matrix: newMatrix });
-    }
-
-    function shiftMatrixUp() {
-        if (!settings.force_matrix) return;
-
-        const speciesCount = settings.species_count;
-        const newMatrix = Array(speciesCount)
-            .fill(null)
-            .map(() => Array(speciesCount).fill(0));
-
-        for (let i = 0; i < speciesCount; i++) {
-            for (let j = 0; j < speciesCount; j++) {
-                if (i === j) {
-                    newMatrix[i][j] = settings.force_matrix[i][j];
-                } else {
-                    const newI = (i - 1 + speciesCount) % speciesCount;
-                    newMatrix[i][j] = settings.force_matrix[newI][j];
-                }
-            }
-        }
-
-        settings.force_matrix = newMatrix;
-        dispatch('matrixTransform', { type: 'shiftUp', matrix: newMatrix });
-    }
-
-    function shiftMatrixDown() {
-        if (!settings.force_matrix) return;
-
-        const speciesCount = settings.species_count;
-        const newMatrix = Array(speciesCount)
-            .fill(null)
-            .map(() => Array(speciesCount).fill(0));
-
-        for (let i = 0; i < speciesCount; i++) {
-            for (let j = 0; j < speciesCount; j++) {
-                if (i === j) {
-                    newMatrix[i][j] = settings.force_matrix[i][j];
-                } else {
-                    const newI = (i + 1) % speciesCount;
-                    newMatrix[i][j] = settings.force_matrix[newI][j];
-                }
-            }
-        }
-
-        settings.force_matrix = newMatrix;
-        dispatch('matrixTransform', { type: 'shiftDown', matrix: newMatrix });
-    }
-
-    function zeroMatrix() {
-        if (!settings.force_matrix) return;
-
-        const speciesCount = settings.species_count;
-        const newMatrix = Array(speciesCount)
-            .fill(null)
-            .map(() => Array(speciesCount).fill(0));
-
-        for (let i = 0; i < speciesCount; i++) {
-            for (let j = 0; j < speciesCount; j++) {
-                if (i === j) {
-                    newMatrix[i][j] = settings.force_matrix[i][j];
-                } else {
-                    newMatrix[i][j] = 0;
-                }
-            }
-        }
-
-        settings.force_matrix = newMatrix;
-        dispatch('matrixTransform', { type: 'zero', matrix: newMatrix });
-    }
-
-    async function flipMatrixSign() {
-        if (!settings.force_matrix) return;
-
-        const speciesCount = settings.species_count;
-        const newMatrix = Array(speciesCount)
-            .fill(null)
-            .map(() => Array(speciesCount).fill(0));
-
-        for (let i = 0; i < speciesCount; i++) {
-            for (let j = 0; j < speciesCount; j++) {
-                if (i === j) {
-                    newMatrix[i][j] = settings.force_matrix[i][j];
-                } else {
-                    newMatrix[i][j] = -settings.force_matrix[i][j];
-                }
-            }
-        }
-
-        settings.force_matrix = newMatrix;
-
-        try {
-            await invoke('update_particle_life_setting', {
-                setting: 'force_matrix',
-                value: newMatrix,
-            });
-            dispatch('matrixTransform', { type: 'flipSign' });
-        } catch (error) {
-            console.error('Failed to flip matrix sign:', error);
-        }
-    }
+    const zeroMatrix = () => applyTransform('zero', zeroAllEntries);
+    const flipMatrixSign = () => applyTransform('flipSign', flipSign);
 </script>
 
 <style>

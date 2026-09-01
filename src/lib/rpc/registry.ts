@@ -12,7 +12,7 @@
  */
 
 import { emit } from './events';
-import { SPEC_MINIMUM_SLIME_MOLD_AGENTS } from '$lib/engine/gpu/limits';
+import { PARTICLE_LIFE_CEILING, SPEC_MINIMUM_SLIME_MOLD_AGENTS } from '$lib/engine/gpu/limits';
 
 export type Handler = (args: Record<string, unknown>) => unknown | Promise<unknown>;
 
@@ -83,10 +83,22 @@ for (const name of [
 // ---------------------------------------------------------------------------
 stub('get_current_settings', {});
 stub('get_current_state', {});
+/*
+ * `update_particle_life_setting` used to be stubbed here, and had a handler.
+ *
+ * It never worked and could not have: no `#[tauri::command]` of that name is
+ * registered in `main.rs`, so on the desktop the one caller — the ± flip-sign
+ * button in InteractionMatrix.svelte — always rejected. It also passed the
+ * setting name under `setting` rather than `settingName`, which the shim does
+ * not rename, so `args.setting_name` was `undefined` even here. Its ten sibling
+ * buttons never called it: they dispatch to the mode, which sends one
+ * `update_simulation_setting force_matrix`. The ± button does that now too, and
+ * the command is gone rather than fixed — the "no unreachable handlers" check
+ * in test/unit/registry.test.ts is what keeps it gone.
+ */
 for (const name of [
     'update_simulation_setting',
     'update_simulation_state',
-    'update_particle_life_setting',
     'update_pellets_trails_state',
     'update_agent_count',
 ])
@@ -107,6 +119,20 @@ stub('get_current_agent_count', null);
  * minimum — the honest answer when no device exists to ask.
  */
 stub('get_agent_count_limit', SPEC_MINIMUM_SLIME_MOLD_AGENTS);
+
+/*
+ * `get_particle_count_limit` is the second command with no desktop original,
+ * and it exists for the same reason as the first: the ceiling is a property of
+ * the device, so the control has to ask rather than hardcode.
+ *
+ * Unlike Slime Mold's, this one is a *compute* ceiling — 50,000 particles is
+ * 1.2 MB, but `particle_life/compute.wgsl` is O(n²) — so on every device that
+ * clears the WebGPU spec minimums the answer is `PARTICLE_LIFE_CEILING` exactly
+ * and the two device-derived bounds in `particleLifeCap` never bind. The stub
+ * is therefore the same number the engine would return, which is honest rather
+ * than lucky: see gpu/limits.ts.
+ */
+stub('get_particle_count_limit', PARTICLE_LIFE_CEILING);
 
 // ---------------------------------------------------------------------------
 // Camera and interaction

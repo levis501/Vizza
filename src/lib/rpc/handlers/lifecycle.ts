@@ -118,6 +118,25 @@ export function registerLifecycleHandlers(): void {
 
     register('reset_agents', async () => ifRunning((c) => c.resetAgents()));
 
+    /**
+     * Particle Life's "Clear Trails", and Primordial Particles' in M9.
+     *
+     * **Not `resetRuntimeState()`**, which is what the Slime Mold shape above
+     * would suggest. The two simulations mean opposite things by it: Slime
+     * Mold's `reset_runtime_state` routes straight to `reset_trails`, while
+     * Particle Life's draws a fresh `random_seed` and re-runs `init.wgsl` over
+     * the whole pool (simulation.rs:3860) — so routing the button there would
+     * teleport every particle instead of wiping the trail it left, and the mode
+     * offers "Regenerate Particles" separately for exactly that. The Rust
+     * command clears both halves of the trail ping-pong to the background
+     * colour and touches nothing else (simulation.rs:2644), which is
+     * `clearTrails()`.
+     *
+     * Until M8 this was a registry stub resolving `null`, so the button
+     * reported success and did nothing.
+     */
+    register('clear_trail_texture', async () => ifRunning((c) => c.clearTrails()));
+
     register('seed_random_noise', async () => ifRunning((c) => c.seedRandomNoise()));
 
     register('randomize_settings', async () => ifRunning((c) => c.randomizeSettings()));

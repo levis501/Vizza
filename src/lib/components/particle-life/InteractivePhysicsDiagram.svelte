@@ -98,6 +98,7 @@
 
 <script lang="ts">
     import { createEventDispatcher, onMount } from 'svelte';
+    import { defaultParticleLifeSettings } from '$lib/engine/sims/particleLife/settings';
 
     export let maxForce: number = 1.0;
     export let maxDistance: number = 0.03;
@@ -583,15 +584,19 @@
         draw();
     }
 
-    // Reset to default values
+    /**
+     * Reset to `Settings::default()`, read from the engine rather than copied.
+     *
+     * Two of the five were wrong: this wrote `max_distance: 0.01` against a
+     * default of **0.05** and `force_beta: 0.3` against **0.5** (settings.rs:147),
+     * so "reset to defaults" left the diagram — and the simulation — in a state
+     * a fresh start never produces, with an interaction radius a fifth of the
+     * real one. Importing `defaultParticleLifeSettings` is the M4 move that
+     * stopped GrayScottMode's option lists drifting from the engine's: two
+     * copies of a constant is one copy too many.
+     */
     function resetToDefaults() {
-        const defaults = {
-            max_force: 0.5,
-            max_distance: 0.01,
-            force_beta: 0.3,
-            friction: 0.5,
-            brownian_motion: 0.5,
-        };
+        const defaults = defaultParticleLifeSettings();
 
         // Update internal values
         internalMaxForce = defaults.max_force;
