@@ -41,7 +41,10 @@ const PARTICLE_COUNT_FLOOR = 1_000;
 
 interface FakeEngineWindow extends Window {
     __vizza?: { installFakeEngine?: () => unknown };
-    __fakeEngine?: { log: Array<{ command: string; args: unknown }> };
+    __fakeEngine?: {
+        log: Array<{ command: string; args: unknown }>;
+        getState: () => Promise<Record<string, unknown>>;
+    };
 }
 
 function collectUnexpected(page: Page): string[] {
@@ -145,6 +148,26 @@ async function lastForceMatrix(page: Page): Promise<number[][]> {
     return values.at(-1) as number[][];
 }
 
+/**
+ * What the engine ended up holding, as opposed to what it was asked for.
+ *
+ * The command log cannot answer that: the fake records the call *before* the
+ * model runs, so an assertion on it passes against a completely dead arm. Every
+ * claim here about a state write being accepted goes through this.
+ */
+function engineState(page: Page): Promise<Record<string, unknown>> {
+    return page.evaluate(() => (window as FakeEngineWindow).__fakeEngine!.getState());
+}
+
+/** The Speed drag box — third in the Settings group, after the two counts. */
+function speedBox(page: Page) {
+    return page
+        .locator('.control-group')
+        .filter({ hasText: 'Particle Count' })
+        .locator('.number-drag-box')
+        .nth(2);
+}
+
 async function setSpeciesCount(page: Page, count: number): Promise<void> {
     const box = countBox(page, 'species');
     await box.dblclick();
@@ -238,6 +261,76 @@ test.describe('particle life mode', () => {
 
         await page.locator('#cursorStrength').fill('10');
         await expect.poll(() => stateUpdates(page, 'cursor_strength')).toContain(10);
+    });
+
+    /**
+     * **Speed — a control neither build had before.**
+     *
+     * The desktop's `update_setting` has a `"dt"` arm (simulation.rs:3475) that
+     * no widget on either build ever reached, so the step has been fixed at
+     * 0.016 for every user of every version. What has to be shown here is that
+     * the multiplier the control shows becomes the `dt` the engine keeps —
+     * asserted out of `getState()`, never out of the log, because the fake
+     * records the call before the model runs and a dead arm would log
+     * identically.
+     */
+    test('the Speed control writes a multiple of the desktop step into dt', async ({ page }) => {
+        await page.goto('/');
+        await installFakeEngine(page);
+        await openParticleLife(page);
+
+        const box = speedBox(page);
+        await expect(box).toHaveText('1x');
+        expect((await engineState(page)).dt).toBeCloseTo(0.016, 10);
+
+        // The range is the measured one — see PARTICLE_LIFE_MIN_SPEED.
+        await expect(box).toHaveAttribute('aria-valuemin', '0.1');
+        await expect(box).toHaveAttribute('aria-valuemax', '4');
+
+        await box.dblclick();
+        await box.locator('input').fill('2.5');
+        await box.locator('input').press('Enter');
+
+        await expect(box).toHaveText('2.5x');
+        // 2.5 x 0.016. The multiplier is a view; `dt` is the only stored number.
+        await expect.poll(async () => (await engineState(page)).dt).toBeCloseTo(0.04, 10);
+        await expect.poll(async () => Object.keys(await engineState(page))).not.toContain('speed');
+
+        // And it survives the round trip the reset button forces, which is what
+        // separates a value the model kept from one it merely echoed.
+        await page.getByRole('button', { name: 'Regenerate Particles' }).click();
+        await expect(box).toHaveText('2.5x');
+    });
+
+    /**
+     * The ceiling is enforced in three places, and this is the one a user meets.
+     *
+     * M8 found this exact defect twice — a particle-count box advertising a
+     * range two orders of magnitude wider than the clamp, and a cursor-strength
+     * slider whose top half was inert. A Speed box that accepted 40x would be
+     * worse than either, because past the break-even a bigger step makes the
+     * simulation *slower*: the control would visibly work backwards.
+     */
+    test('the Speed control cannot be typed past the range it advertises', async ({ page }) => {
+        await page.goto('/');
+        await installFakeEngine(page);
+        await openParticleLife(page);
+
+        const box = speedBox(page);
+
+        await box.dblclick();
+        await box.locator('input').fill('40');
+        await box.locator('input').press('Enter');
+
+        await expect(box).toHaveText('4x');
+        await expect.poll(async () => (await engineState(page)).dt).toBeCloseTo(0.064, 10);
+
+        await box.dblclick();
+        await box.locator('input').fill('-3');
+        await box.locator('input').press('Enter');
+
+        await expect(box).toHaveText('0.1x');
+        await expect.poll(async () => (await engineState(page)).dt).toBeCloseTo(0.0016, 10);
     });
 
     /**

@@ -21,6 +21,22 @@ import {
     shiftUp,
     zeroMatrix,
 } from '../../src/lib/engine/sims/particleLife/matrixOperations';
+import {
+    PARTICLE_LIFE_DEFAULT_DT,
+    PARTICLE_LIFE_MAX_DT,
+    PARTICLE_LIFE_MAX_SPEED,
+    PARTICLE_LIFE_MIN_DT,
+    PARTICLE_LIFE_MIN_SPEED,
+    clampParticleLifeDt,
+    defaultParticleLifeSettings,
+    defaultParticleLifeState,
+    packParticleLifeSimParams,
+    particleLifeDtToSpeed,
+    particleLifeSpeedToDt,
+    particleLifeStateDocument,
+    updateParticleLifeSetting,
+    updateParticleLifeState,
+} from '../../src/lib/engine/sims/particleLife/settings';
 
 const ROOT = resolve(__dirname, '../..');
 const PARTICLE_LIFE = join(ROOT, 'src-tauri/src/simulations/particle_life');
@@ -945,5 +961,135 @@ describe('matrix operation algebra', () => {
             // generated entry is already inside [-1, 1].
             expect(scaleForceMatrix(m, 1.0)).toEqual(m);
         }
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Speed — the control this build adds over the desktop one
+// ---------------------------------------------------------------------------
+
+/**
+ * `dt` is the integrator's step and word 9 of `SimParams`; **Speed** is how the
+ * mode presents it, as a multiple of the 0.016 the desktop build is welded to.
+ *
+ * There is deliberately only one stored number. The multiplier is a view of
+ * `state.dt`, converted at the control, so a preset, a `get_state` round trip
+ * and the uniform all keep seeing the field the shader reads.
+ */
+describe('the Speed multiplier', () => {
+    const inputs = {
+        width: 256,
+        height: 128,
+        particleCount: 1000,
+        cursorActive: 0 as const,
+        cursorX: 0,
+        cursorY: 0,
+    };
+
+    it('is 1x at the default, and 1x is exactly the desktop step', () => {
+        expect(PARTICLE_LIFE_DEFAULT_DT).toBe(0.016);
+        expect(defaultParticleLifeState().dt).toBe(PARTICLE_LIFE_DEFAULT_DT);
+        expect(particleLifeDtToSpeed(PARTICLE_LIFE_DEFAULT_DT)).toBe(1);
+        expect(particleLifeSpeedToDt(1)).toBe(PARTICLE_LIFE_DEFAULT_DT);
+    });
+
+    it('maps the multiplier onto dt by multiplying the default step', () => {
+        expect(particleLifeSpeedToDt(2)).toBeCloseTo(0.032, 12);
+        expect(particleLifeSpeedToDt(0.5)).toBeCloseTo(0.008, 12);
+        expect(particleLifeSpeedToDt(PARTICLE_LIFE_MAX_SPEED)).toBeCloseTo(
+            PARTICLE_LIFE_MAX_DT,
+            12
+        );
+        expect(particleLifeSpeedToDt(PARTICLE_LIFE_MIN_SPEED)).toBeCloseTo(
+            PARTICLE_LIFE_MIN_DT,
+            12
+        );
+    });
+
+    it('round-trips every multiplier the control can produce', () => {
+        for (let speed = PARTICLE_LIFE_MIN_SPEED; speed <= PARTICLE_LIFE_MAX_SPEED; speed += 0.1) {
+            expect(particleLifeDtToSpeed(particleLifeSpeedToDt(speed))).toBeCloseTo(speed, 9);
+        }
+    });
+
+    it('clamps both ends instead of accepting a step that is not offered', () => {
+        expect(particleLifeSpeedToDt(1000)).toBe(PARTICLE_LIFE_MAX_DT);
+        expect(particleLifeSpeedToDt(0)).toBe(PARTICLE_LIFE_MIN_DT);
+        expect(particleLifeSpeedToDt(-5)).toBe(PARTICLE_LIFE_MIN_DT);
+
+        expect(clampParticleLifeDt(10)).toBe(PARTICLE_LIFE_MAX_DT);
+        expect(clampParticleLifeDt(0)).toBe(PARTICLE_LIFE_MIN_DT);
+        expect(clampParticleLifeDt(-1)).toBe(PARTICLE_LIFE_MIN_DT);
+        // Inside the range, untouched — a clamp that rounds would quietly move
+        // every value the drag box produces.
+        expect(clampParticleLifeDt(0.02)).toBe(0.02);
+    });
+
+    it('falls back to the default rather than propagating a non-finite step', () => {
+        // `f[9] = state.dt` with a NaN makes every position NaN on the next
+        // dispatch, and `wrap_position`'s floor keeps it that way for good.
+        for (const bad of [NaN, Infinity, -Infinity, null, undefined, '0.5', {}]) {
+            expect(clampParticleLifeDt(bad)).toBe(PARTICLE_LIFE_DEFAULT_DT);
+            expect(particleLifeSpeedToDt(bad)).toBe(PARTICLE_LIFE_DEFAULT_DT);
+        }
+        expect(particleLifeDtToSpeed(NaN)).toBe(1);
+    });
+
+    it('displays an out-of-range stored step inside the range, never outside it', () => {
+        // A desktop `get_state` can carry any `dt` at all: its `update_setting`
+        // arm (simulation.rs:3475) does `dt as f32` with no clamp of any kind.
+        expect(particleLifeDtToSpeed(1.0)).toBe(PARTICLE_LIFE_MAX_SPEED);
+        expect(particleLifeDtToSpeed(1e-9)).toBe(PARTICLE_LIFE_MIN_SPEED);
+    });
+
+    /**
+     * The clamp has to sit on the *arm*, not on the control, because a preset
+     * and a restored state document both reach the model without going near a
+     * widget. This is the M7 three-places rule with the write funnelled into
+     * one place so there is only one.
+     */
+    it('clamps a value arriving from a preset or a restored session', () => {
+        const settings = defaultParticleLifeSettings();
+
+        const viaSetting = defaultParticleLifeState();
+        expect(updateParticleLifeSetting(settings, viaSetting, 'dt', 5)).toBe('sim-params');
+        expect(viaSetting.dt).toBe(PARTICLE_LIFE_MAX_DT);
+
+        const viaState = defaultParticleLifeState();
+        expect(updateParticleLifeState(settings, viaState, 'dt', 0.0)).toBe('sim-params');
+        expect(viaState.dt).toBe(PARTICLE_LIFE_MIN_DT);
+
+        // And an in-range value is passed through exactly.
+        const ordinary = defaultParticleLifeState();
+        updateParticleLifeState(settings, ordinary, 'dt', particleLifeSpeedToDt(2.5));
+        expect(particleLifeDtToSpeed(ordinary.dt)).toBeCloseTo(2.5, 9);
+    });
+
+    it('keeps dt as the single stored field, and it is what the uniform carries', () => {
+        const settings = defaultParticleLifeSettings();
+        const state = defaultParticleLifeState();
+        updateParticleLifeState(settings, state, 'dt', particleLifeSpeedToDt(3));
+
+        // No second field appeared beside it — the multiplier is a view.
+        const document = particleLifeStateDocument(state);
+        expect(document.dt).toBe(state.dt);
+        expect(Object.keys(document)).not.toContain('speed');
+
+        // Word 9 of SimParams is the clamped dt, not the multiplier.
+        const words = new Float32Array(packParticleLifeSimParams(settings, state, inputs));
+        expect(words[9]).toBeCloseTo(3 * PARTICLE_LIFE_DEFAULT_DT, 6);
+    });
+
+    /**
+     * The ceiling is measured, not chosen — see PARTICLE_LIFE_MIN_SPEED's note
+     * and the L3 test. This pins the two numbers so the range cannot be widened
+     * without someone reading why it is where it is.
+     */
+    it('advertises the range the measurements support', () => {
+        expect(PARTICLE_LIFE_MIN_SPEED).toBe(0.1);
+        expect(PARTICLE_LIFE_MAX_SPEED).toBe(4.0);
+        // Below the 4.5x break-even at the default friction of 0.5, where a
+        // bigger step starts buying *less* motion per frame than 1x does.
+        expect(PARTICLE_LIFE_MAX_SPEED).toBeLessThan(4.5);
     });
 });

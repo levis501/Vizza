@@ -92,8 +92,14 @@ import {
     PARTICLE_LIFE_VERTEX_SHADER_PATH,
 } from '$lib/engine/sims/particleLife';
 import {
+    defaultParticleLifeSettings,
     particleLifeMaxSpecies,
+    particleLifeSpeedToDt,
+    PARTICLE_LIFE_DEFAULT_DT,
+    PARTICLE_LIFE_MAX_DT,
     PARTICLE_LIFE_MAX_SPECIES,
+    PARTICLE_LIFE_MAX_SPEED,
+    PARTICLE_LIFE_MIN_DT,
     PARTICLE_LIFE_SIM_PARAM_BYTES,
     PARTICLE_STRIDE,
 } from '$lib/engine/sims/particleLife/settings';
@@ -4448,6 +4454,179 @@ test('a compute step moves every particle and leaves the pool bounded', async ()
             `particle ${i} escaped the reflecting boundary at (${bounced.x[i]}, ${bounced.y[i]})`
         );
     }
+
+    sim.destroy();
+    target.destroy();
+});
+
+/**
+ * The Speed control's range, measured rather than assumed.
+ *
+ * Two separate claims, because the obvious one turned out to be false.
+ *
+ * **There is no stability ceiling.** The expectation was the standard explicit-
+ * Euler one — that a big enough step makes the pool fly apart or go non-finite.
+ * It cannot. `wrap_position` (compute.wgsl:97) is a true modulo, so a position
+ * is in the box by construction whatever the velocity, and the velocity itself
+ * is damped every step. Swept to 100x across the extremes of `max_force`,
+ * `max_distance`, `friction`, `brownian_motion`, wrapping and an eight-species
+ * all-attracting matrix, nothing ever went non-finite. The three combinations
+ * below are the sharpest of that sweep, held at the ceiling the control offers.
+ *
+ * **What binds is the friction rescaling, and it binds the other way.**
+ * `compute.wgsl:254` damps by `pow(friction, dt * 60)`, exponential in the
+ * step, while the impulse on the line above is `force * dt`, linear in it — so
+ * per-frame displacement rises to a peak and then collapses toward zero. At the
+ * shipped default friction of 0.5 the peak is near 2.4x and the curve falls
+ * back through its 1x value at about 4.5x. `PARTICLE_LIFE_MAX_SPEED` is 4.0
+ * precisely so that the top of the control is still faster than the bottom;
+ * this test is what holds that, and it fails if the ceiling is raised past the
+ * break-even. See `PARTICLE_LIFE_MIN_SPEED` in settings.ts for the derivation
+ * and the numbers.
+ */
+test('the speed ceiling is the fastest the step gets, not the last stable one', async () => {
+    const [target, view] = renderTarget(32, 'particle life speed target');
+
+    /** Mean distance covered per frame, over the toroidal wrap. */
+    const perFrameMotion = async (
+        speed: number,
+        seed: number,
+        friction: number
+    ): Promise<number> => {
+        const sim = await makeParticleLife({ particleCount: 512, seed });
+        sim.updateSetting('friction', friction);
+        sim.updateState('dt', particleLifeSpeedToDt(speed));
+
+        // Long enough to reach the steady state the friction/impulse balance
+        // settles into; the transient is faster than the plateau at every step.
+        for (let i = 0; i < 200; i++) sim.renderFrame(view, 1 / 60);
+        const before = await readParticles(sim);
+        const frames = 60;
+        for (let i = 0; i < frames; i++) sim.renderFrame(view, 1 / 60);
+        const after = await readParticles(sim);
+
+        // A wrap must not read as a jump across the whole world.
+        const shortest = (d: number): number => d - 2 * Math.round(d / 2);
+        let total = 0;
+        for (let i = 0; i < before.x.length; i++) {
+            total += Math.hypot(
+                shortest(after.x[i] - before.x[i]),
+                shortest(after.y[i] - before.y[i])
+            );
+        }
+        sim.destroy();
+        return total / before.x.length / frames;
+    };
+
+    // Two seeds averaged: the per-seed spread on this measurement is under 5%,
+    // and the margin being asserted is about 10%.
+    const motion = async (speed: number, friction: number): Promise<number> =>
+        ((await perFrameMotion(speed, PARTICLE_LIFE_SEED, friction)) +
+            (await perFrameMotion(speed, 0x0bad_c0de, friction))) /
+        2;
+
+    const DEFAULT_FRICTION = defaultParticleLifeSettings().friction;
+    const atOne = await motion(1, DEFAULT_FRICTION);
+    const atCeiling = await motion(PARTICLE_LIFE_MAX_SPEED, DEFAULT_FRICTION);
+
+    assert(atOne > 0, 'the pool is not moving at all at 1x; nothing below means anything');
+    assert(
+        atCeiling > atOne,
+        `${PARTICLE_LIFE_MAX_SPEED}x moves ${atCeiling.toExponential(3)} per frame against ` +
+            `${atOne.toExponential(3)} at 1x — the top of the control is slower than the ` +
+            `bottom, so the ceiling is past the break-even`
+    );
+
+    /**
+     * The reversal itself, shown without leaving the range the control offers.
+     *
+     * `speed*` — the fastest step — is `1.5936 / (0.96 · ln(1/friction))`, so
+     * lowering the friction slides it left. At 0.3 it is about 1.4x, which puts
+     * the ceiling well past the break-even and makes the whole effect visible
+     * between two values a user can actually select. This is why 4.0 is not a
+     * safety margin under some larger stable value: raise `friction` and the
+     * ceiling could honestly be 10x, lower it and even 4x is too generous.
+     */
+    const slipperyOne = await motion(1, 0.3);
+    const slipperyCeiling = await motion(PARTICLE_LIFE_MAX_SPEED, 0.3);
+    assert(
+        slipperyCeiling < slipperyOne,
+        `at friction 0.3 the ceiling still moves ${slipperyCeiling.toExponential(3)} per frame ` +
+            `against ${slipperyOne.toExponential(3)} at 1x — pow(friction, dt*60) is not ` +
+            `costing a bigger step what it was measured to, so the ceiling needs re-deriving`
+    );
+
+    // Nothing destabilises at the ceiling, in the combinations most likely to.
+    const extremes: Array<[string, Record<string, unknown>]> = [
+        ['no damping', { friction: 1.0, max_force: 10, max_distance: 1.0 }],
+        ['full thermal kick', { brownian_motion: 1.0, max_force: 10, friction: 0.99 }],
+        ['reflecting walls', { wrap_edges: false, max_force: 10, max_distance: 1.0 }],
+    ];
+    for (const [what, overrides] of extremes) {
+        const sim = await makeParticleLife({ particleCount: 256 });
+        // Eight species that all attract each other, which is the strongest
+        // pair force the matrix editor can express.
+        sim.updateSetting('species_count', 8);
+        sim.updateSetting(
+            'force_matrix',
+            Array.from({ length: 8 }, () => new Array(8).fill(1.0))
+        );
+        for (const [name, value] of Object.entries(overrides)) sim.updateSetting(name, value);
+        sim.updateState('dt', PARTICLE_LIFE_MAX_DT);
+
+        for (let i = 0; i < 240; i++) sim.renderFrame(view, 1 / 60);
+        const particles = await readParticles(sim);
+        assert(
+            !hasNonFinite(particles.x) && !hasNonFinite(particles.y),
+            `a position went non-finite at ${PARTICLE_LIFE_MAX_SPEED}x with ${what}`
+        );
+        assert(
+            !hasNonFinite(particles.vx) && !hasNonFinite(particles.vy),
+            `a velocity went non-finite at ${PARTICLE_LIFE_MAX_SPEED}x with ${what}`
+        );
+        for (let i = 0; i < particles.x.length; i++) {
+            assert(
+                Math.abs(particles.x[i]) <= 1 && Math.abs(particles.y[i]) <= 1,
+                `particle ${i} left the world box at ${PARTICLE_LIFE_MAX_SPEED}x with ${what}`
+            );
+        }
+        sim.destroy();
+    }
+
+    target.destroy();
+});
+
+/**
+ * The clamp, on the path a preset or a desktop state document arrives on.
+ *
+ * `dt` is `State`, so it reaches the model through `updateState`; the Rust's own
+ * arm (simulation.rs:3475) has no clamp at all, which is exactly why one is
+ * needed here now that a control writes to it. Asserted on `getState()` and on
+ * the pool rather than on the call, per M8's note: the fake logs before the
+ * model runs, and so would any assertion on the request.
+ */
+test('an out-of-range dt is clamped rather than dispatched', async () => {
+    const sim = await makeParticleLife({ particleCount: 128 });
+    const [target, view] = renderTarget(32, 'particle life dt clamp target');
+
+    sim.updateState('dt', 1.0);
+    assertClose(sim.getState().dt as number, PARTICLE_LIFE_MAX_DT, 1e-9, 'dt above the ceiling');
+
+    sim.updateState('dt', 1e-9);
+    assertClose(sim.getState().dt as number, PARTICLE_LIFE_MIN_DT, 1e-12, 'dt below the floor');
+
+    // The default is 1x exactly, so a fresh pool is what it always was.
+    const fresh = await makeParticleLife({ particleCount: 128 });
+    assert(
+        fresh.getState().dt === PARTICLE_LIFE_DEFAULT_DT,
+        `a fresh simulation starts at dt ${fresh.getState().dt}, not the desktop's 0.016`
+    );
+    fresh.destroy();
+
+    // And a step at the clamped value still runs and still produces a live pool.
+    for (let i = 0; i < 30; i++) sim.renderFrame(view, 1 / 60);
+    const particles = await readParticles(sim);
+    assert(!hasNonFinite(particles.x), 'the clamped step produced a non-finite pool');
 
     sim.destroy();
     target.destroy();

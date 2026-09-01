@@ -239,6 +239,106 @@ export function particleLifeMaxSpecies(fragmentShaderSource: string): number | n
 }
 
 // ---------------------------------------------------------------------------
+// Speed — the time step, as a control
+// ---------------------------------------------------------------------------
+
+/**
+ * `State::dt` as the constructor sets it (simulation.rs:657).
+ *
+ * The integrator's step, and word 9 of `SimParams`. Named rather than inlined
+ * because "Speed" is defined as a multiple of it, so the two cannot drift.
+ */
+export const PARTICLE_LIFE_DEFAULT_DT = 0.016;
+
+/**
+ * The Speed control's range, as a multiple of `PARTICLE_LIFE_DEFAULT_DT`.
+ *
+ * **This control does not exist on the desktop build.** `update_setting` has a
+ * `"dt"` arm (simulation.rs:3475) that no widget on either build reaches, so
+ * `dt` has always been fixed at 0.016 for every user. It is added here because
+ * a display refresh rate caps the *frame* rate — rAF cannot beat vsync, so the
+ * FPS limiter's 1200 is unreachable — and the step is the only knob that
+ * changes how far the particles get per frame.
+ *
+ * **The ceiling is not a stability limit, and there is no stability limit.**
+ * The expectation going in was the usual explicit-Euler one: past some step the
+ * pool flies apart or goes non-finite. Measured on SwiftShader it never does —
+ * 12 extreme setting combinations (`max_force` 10, `max_distance` 1.0, friction
+ * 0.01 and 1.0, `brownian_motion` 1.0, 8 species on an all-attracting matrix,
+ * wrapping on and off) times multipliers to 100x produced **zero** non-finite
+ * values and left every position inside the world box. It cannot blow up:
+ * `wrap_position` (compute.wgsl:97) is a true modulo, and velocity is damped
+ * every step.
+ *
+ * What binds instead is that damping. `compute.wgsl:254` applies friction as
+ * `pow(friction, dt * 60)` — *exponential* in the step — while the force
+ * impulse on the line above is `force * dt`, merely linear in it. Steady-state
+ * displacement per frame therefore goes as
+ *
+ *     d(dt) ∝ dt² · f^(60·dt) / (1 − f^(60·dt))
+ *
+ * which rises, peaks, and then collapses. Substituting k = 60·dt·ln(1/f) makes
+ * it k²/(eᵏ − 1), maximal at the root of 2 − 2e^(−k) = k, k ≈ 1.5936 — so the
+ * *fastest* step is at
+ *
+ *     speed* = 1.5936 / (0.96 · ln(1 / friction))
+ *
+ * That formula predicted the measured peak at all eight frictions sampled
+ * (0.3 → 1.4x, 0.5 → 2.4x, 0.7 → 4.7x, 0.85 → 10.2x, 0.95 → 32x). At the
+ * shipped default friction of 0.5 the peak is 2.4x and the curve falls back
+ * through its 1x value at **4.5x** (measured: 3.28e-5 world units per frame at
+ * 1x, 4.33e-5 at the 2.5x peak, 3.48e-5 at 4.25x, 3.10e-5 at 4.75x; three
+ * seeds, spread under 5%). Past there the control would make the simulation
+ * *slower*, and by 25x it freezes outright as the velocity underflows.
+ *
+ * 4.0x is therefore the ceiling: the largest round multiplier below that
+ * break-even, so every value the control offers is faster than leaving it
+ * alone. Advertising the 10x or 100x that "stability" would permit would be
+ * M8's `cursor_strength` defect again — a slider whose top half does nothing,
+ * except that here the top half actively undoes what the user asked for.
+ *
+ * The honest caveat, which belongs with the user rather than in a clamp: the
+ * whole lever is worth only about **1.32x** at the default friction. Friction
+ * is the far stronger speed control — 0.5 → 0.95 alone is a 12x increase in
+ * per-frame displacement with `dt` untouched — because raising it is what moves
+ * `speed*` far enough right for a bigger step to pay.
+ */
+export const PARTICLE_LIFE_MIN_SPEED = 0.1;
+export const PARTICLE_LIFE_MAX_SPEED = 4.0;
+
+/** The `dt` range the clamp enforces, derived so the two cannot disagree. */
+export const PARTICLE_LIFE_MIN_DT = PARTICLE_LIFE_DEFAULT_DT * PARTICLE_LIFE_MIN_SPEED;
+export const PARTICLE_LIFE_MAX_DT = PARTICLE_LIFE_DEFAULT_DT * PARTICLE_LIFE_MAX_SPEED;
+
+/**
+ * Clamp a `dt` into the range the Speed control covers.
+ *
+ * Reduces rather than rejects, like `clampParticleCount`: a desktop state
+ * document or a restored session carrying the unclamped `dt` that
+ * `update_setting`'s arm would have accepted still starts, at the nearest step
+ * this build will run. A non-finite value falls back to the default rather than
+ * poisoning every position on the next dispatch.
+ */
+export function clampParticleLifeDt(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return PARTICLE_LIFE_DEFAULT_DT;
+    return Math.max(PARTICLE_LIFE_MIN_DT, Math.min(PARTICLE_LIFE_MAX_DT, value));
+}
+
+/** Speed multiplier → the `dt` that goes into state and the uniform. */
+export function particleLifeSpeedToDt(speed: unknown): number {
+    if (typeof speed !== 'number' || !Number.isFinite(speed)) return PARTICLE_LIFE_DEFAULT_DT;
+    const clamped = Math.max(PARTICLE_LIFE_MIN_SPEED, Math.min(PARTICLE_LIFE_MAX_SPEED, speed));
+    return clamped * PARTICLE_LIFE_DEFAULT_DT;
+}
+
+/** `dt` → the multiplier the control displays. The inverse of the above. */
+export function particleLifeDtToSpeed(dt: unknown): number {
+    if (typeof dt !== 'number' || !Number.isFinite(dt)) return 1;
+    const speed = dt / PARTICLE_LIFE_DEFAULT_DT;
+    return Math.max(PARTICLE_LIFE_MIN_SPEED, Math.min(PARTICLE_LIFE_MAX_SPEED, speed));
+}
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -358,7 +458,7 @@ export function defaultParticleLifeState(): ParticleLifeState {
     return {
         particle_count: PARTICLE_LIFE_DEFAULT_PARTICLES,
         random_seed: 0,
-        dt: 0.016,
+        dt: PARTICLE_LIFE_DEFAULT_DT,
         cursor_size: 0.5,
         cursor_strength: 5.0,
         traces_enabled: false,
@@ -616,7 +716,12 @@ export function updateParticleLifeSetting(
             return 'respawn';
 
         case 'dt':
-            state.dt = asFloat(value, name);
+            // The Rust arm (simulation.rs:3475) takes whatever `as_f64` gives
+            // it. Clamped here because this build puts a control on it — see
+            // PARTICLE_LIFE_MIN_SPEED for the range and the measurements — and
+            // because clamping at the one arm every external write funnels
+            // through is the M7 three-places rule with only one place needed.
+            state.dt = clampParticleLifeDt(asFloat(value, name));
             return 'sim-params';
 
         case 'random_seed':

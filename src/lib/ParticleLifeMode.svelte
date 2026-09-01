@@ -188,6 +188,39 @@
                         precision={0}
                         on:change={(e) => updateSpeciesCount(e.detail)}
                     />
+
+                    <!--
+                        Speed. **The desktop build has no such control** — its
+                        `update_setting` has a `"dt"` arm (simulation.rs:3475)
+                        that nothing on either build ever reached, so `dt` has
+                        been fixed at 0.016 for every user of every version.
+
+                        Here rather than in the Physics fieldset, for two
+                        reasons. `InteractivePhysicsDiagram` owns exactly the
+                        five `Settings` fields of the force law, and its "Reset
+                        to Defaults" writes `Settings::default()` — a `State`
+                        field inside it would either have to be swept into that
+                        reset, which would stop it being a faithful port, or sit
+                        there being ignored by it. And this control-group is
+                        already where the two "how much simulation" numbers
+                        live, one of them (`particle_count`) also `State`.
+
+                        The range is 0.1x-4x and the ceiling is measured, not
+                        chosen: see PARTICLE_LIFE_MIN_SPEED in settings.ts for
+                        why nothing here can destabilise and why 4x is
+                        nonetheless where the useful range ends.
+                    -->
+                    <label for="simulationSpeed">Speed</label>
+                    <NumberDragBox
+                        id="simulationSpeed"
+                        value={particleLifeDtToSpeed(state.dt)}
+                        min={PARTICLE_LIFE_MIN_SPEED}
+                        max={PARTICLE_LIFE_MAX_SPEED}
+                        step={0.1}
+                        precision={1}
+                        unit="x"
+                        on:change={(e) => updateSpeed(e.detail)}
+                    />
                 </div>
 
                 <!-- Interaction Matrix -->
@@ -251,11 +284,15 @@
     import { createSyncManager } from './utils/sync';
     import {
         BACKGROUND_COLOR_MODES,
+        PARTICLE_LIFE_MAX_SPEED,
         PARTICLE_LIFE_MIN_PARTICLES,
+        PARTICLE_LIFE_MIN_SPEED,
         PARTICLE_LIFE_PARTICLE_CEILING,
         POSITION_GENERATORS,
         TYPE_GENERATORS,
         clampParticleCount,
+        particleLifeDtToSpeed,
+        particleLifeSpeedToDt,
     } from '$lib/engine/sims/particleLife/settings';
     import { MATRIX_GENERATORS } from '$lib/engine/sims/particleLife/matrix';
     import './shared-theme.css';
@@ -689,6 +726,23 @@
 
     async function updateTraceFade(value: number) {
         const result = await syncManager.updateStateOptimistic(state, 'trace_fade', value);
+        if (result) state = result;
+    }
+
+    /**
+     * Speed — a control the desktop build does not have.
+     *
+     * `dt` is `State`, so this takes the same `update_simulation_state` route as
+     * the five above rather than `update_simulation_setting`; the engine's arm
+     * clamps it, which is why the value is converted here and re-read from
+     * `state.dt` for display rather than held in a second variable.
+     */
+    async function updateSpeed(value: number) {
+        const result = await syncManager.updateStateOptimistic(
+            state,
+            'dt',
+            particleLifeSpeedToDt(value)
+        );
         if (result) state = result;
     }
 
