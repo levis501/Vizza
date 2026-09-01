@@ -517,7 +517,7 @@ Smallest sim in the repo: 1 shader, 316 lines, one already-legal write-only stor
 - [x] **Clamp the UI to `caps.slimeMoldAgents`; default dropped to 1M.** Clamped in three places, each earning its place: the control (so the user is told), the mode (so a restored value never reaches the command), and the handler (last stop before `createBuffer`). `EngineContext` gained `caps()`, `setAgentCount()` and `resetAgents()`
 - [x] Image upload for position + mask images — slots `position` and `mask`
 - [x] **Test (L1):** 75 tests · **Test (L3):** 14 tests · **Test (L4):** 18 tests
-- [ ] **Visible:** slime mold trails — **needs confirming at :9994 in a real browser**; see M3's environment limitation
+- [x] **Visible:** slime mold trails — confirmed at :9994 in a real browser
 
 **The headline defect: `update_agents` was skipping 15 of every 16 agents.**
 
@@ -572,7 +572,7 @@ So the old pattern's ghost outlives its mask by roughly a quarter of a minute, a
 
 ### M8 — Particle Life
 - [ ] Port 11 shaders incl. `compute.wgsl` (280), `init.wgsl` (375), `tile_render.wgsl` (248)
-- [ ] Port 22 `MatrixGenerator`s + 11 `TypeGenerator`s (`settings.rs:186-670`) and `matrix_operations.rs` (567)
+- [ ] Port 22 `MatrixGenerator`s + 11 `TypeGenerator`s (`settings.rs:186-670`) and `matrix_operations.rs` — **128 lines of code, not 567**: the file is 11 pure functions followed by a 439-line `#[cfg(test)]` module of 16 tests. Those tests are ground truth for the L1 port, so the file is a smaller port and a larger test win than the count suggested
 - [ ] **Test (L1):** all 22 generators produce N×N in [-1,1]; rotate ∘ rotate⁻¹ = identity
 - [ ] **Visible:** particle life with a live interaction matrix
 
