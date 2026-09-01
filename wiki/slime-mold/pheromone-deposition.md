@@ -30,8 +30,10 @@ Alongside the agent buffer there is a second structure, the **trail map**: one
 `f32` per simulation pixel (`compute.wgsl:44`), held in the range `0.0 … 1.0` by
 the clamp on every write. That number is the pheromone concentration at that
 point, and it _is_ the image — the display pass reads the trail map and maps its
-intensity through the active color scheme, a 256-entry LUT
-(`display.wgsl:102`, `get_lut_color`).
+intensity through the active color scheme, a 256-entry LUT (`display.wgsl:102`,
+`get_lut_color`; see [Color Schemes](../gradient-editor/color-schemes.md) for
+how that lookup works and why the scheme you pick changes what the field appears
+to be doing).
 
 The agents themselves are never drawn. You only ever see their residue.
 

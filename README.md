@@ -72,9 +72,13 @@ Moiré patterns with distortion effects.
 
 The [wiki](wiki/) explains what the simulations are actually doing — what the
 settings mean in terms of what you see on screen, and which ones are worth
-reaching for. Start with
-[Pheromone Deposition](wiki/slime-mold/pheromone-deposition.md) if you have
-Slime Mold open.
+reaching for. There is a page per simulation, each built around the one
+mechanism that simulation reduces to, with every claim cited to the line of
+shader or Rust that implements it.
+
+Start with [Pheromone Deposition](wiki/slime-mold/pheromone-deposition.md) if you
+have Slime Mold open, or [Color Schemes](wiki/gradient-editor/color-schemes.md)
+for how any simulation's output becomes a picture.
 
 ## For Developers
 
